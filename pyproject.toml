@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moransi_sourcemasking"
+version = "0.1.0"
+description = "Masking and block-statistics tools for astronomical images (local Moran's I source masking, robust block averaging, drizzle noise-correlation correction)."
+readme = "README.md"
+requires-python = ">=3.10"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Henry C. Ferguson" },  
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "numpy",
+    "astropy",
+    "pyyaml",
+    "python-box",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+dev = ["pytest", "build", "twine"]
+
+[project.urls]
+# Homepage = "https://github.com/your-org/fieldstats"
+
+[tool.setuptools.packages.find]
+where = ["src"]
