@@ -49,6 +49,8 @@ import numpy as np
 
 from astropy.convolution import convolve, convolve_fft, Tophat2DKernel, Gaussian2DKernel
 
+from .gradient_mask_growth import gradient_grow_mask
+
 
 ##################################################################################
 # For logging and profiling
@@ -177,6 +179,36 @@ class SlidingMoranSourceFilter:
           (dilation) to the dilate mask (1= source, 0 = background)
     dilation_threshold : float
         Threshold to apply to the dilated mask to convert back to a boolean
+    grow_half_size : int
+        Half-size of the local linear-fit window used by the adaptive
+        gradient-significance mask growth in flag_sources (replaces the
+        old dilation_tophat convolution-threshold growth). Always
+        native-pixel scale, like corr_half/bg_half/exclude_half -- when
+        growth runs at block resolution (grow_at_block_resolution=True),
+        it is converted to block-grid units the same way those are.
+    grow_k : float
+        Significance threshold (in sigma) for the inward-gradient test
+        that drives adaptive growth -- a ring keeps growing while its
+        median z-score exceeds this.
+    grow_max_iter : int
+        Maximum number of growth iterations (in whatever grid -- native
+        or block -- growth is running on; see grow_at_block_resolution).
+    grow_at_block_resolution : bool
+        If True and block_size > 0, adaptive growth runs on the same
+        block-averaged grid used for the Moran's I computation (block-
+        averaging `image` itself, block-reducing the seed mask, growing
+        there, then replicating back to native resolution) instead of
+        at full native resolution. Much cheaper for large images /
+        large grow_half_size -- exactly the same speed argument that
+        motivates block-averaging for the I statistic itself.
+    grow_min_valid_frac_block : float
+        Only used when grow_at_block_resolution is True: passed as
+        min_valid_frac to the block_average() call on `image`.
+    treat_weight_as_inverse_variance : bool
+        If True (and a `weight` array is passed to flag_sources), use
+        sqrt(1/weight) as the per-pixel sky-noise map for the growth
+        significance test, instead of estimating a single sky sigma
+        empirically from the image.
     lower_percentile : pixels with I below this threshold are masked as "sources"
     upper_percentile : pixels with I above this threshold are masked as "sources"
     corr_half, bg_half, exclude_half : int
@@ -212,6 +244,13 @@ class SlidingMoranSourceFilter:
         post_tophat: int = 0,
         dilation_tophat: int = 0,
         dilation_threshold: int = 0.05,
+        grow_half_size: int = 8,
+        grow_radial_step: float = 1.0,
+        grow_k: float = 3.0,
+        grow_max_iter: int = 0,
+        grow_at_block_resolution: bool = True,
+        grow_min_valid_frac_block: float = 0.5,
+        treat_weight_as_inverse_variance: bool = False,
         i_lower_nsigma: float = 100,
         i_upper_nsigma: float = 10,
         block_size: int = 0,
@@ -238,6 +277,13 @@ class SlidingMoranSourceFilter:
         self.post_tophat = post_tophat
         self.dilation_tophat = dilation_tophat
         self.dilation_threshold = dilation_threshold
+        self.grow_half_size = grow_half_size
+        self.grow_radial_step = grow_radial_step
+        self.grow_k = grow_k
+        self.grow_max_iter = grow_max_iter
+        self.grow_at_block_resolution = grow_at_block_resolution
+        self.grow_min_valid_frac_block = grow_min_valid_frac_block
+        self.treat_weight_as_inverse_variance = treat_weight_as_inverse_variance
         self.i_lower_nsigma = i_lower_nsigma
         self.i_upper_nsigma = i_upper_nsigma
         self.block_size = block_size
@@ -525,6 +571,167 @@ class SlidingMoranSourceFilter:
             neighbor_weight_sum=rep(coarse.neighbor_weight_sum),
         )
 
+    # ------------------------------------------------------------------
+    # flag_sources, broken into its constituent steps
+    # ------------------------------------------------------------------
+
+    def _pre_convolve(self, image, bad_mask):
+        """Tophat-smooth `image` (radius pre_tophat) before computing
+        Moran's I, if pre_tophat > 0; otherwise returns image unchanged."""
+        if self.pre_tophat <= 0:
+            return image
+        return convolve_fft(image, Tophat2DKernel(self.pre_tophat),
+                             mask=bad_mask,
+                             boundary='fill',
+                             fill_value=np.nan,
+                             nan_treatment='interpolate',
+                             normalize_kernel=True,
+                             preserve_nan=True,
+                             min_wt=0.5,
+                             fft_pad=True,
+                             allow_huge=True)
+
+    def _compute_istat(self, cimg, bad_mask, weight):
+        """Compute Moran's I, block-averaged or native-scale depending
+        on self.block_size. Returns the LocalMoranResult."""
+        if self.block_size > 0:
+            return self.compute_block_averaged(cimg, block=self.block_size,
+                                                bad_mask=bad_mask, weight=weight)
+        return self.compute(cimg, bad_mask=bad_mask, weight=weight)
+
+    def _smooth_istat(self, moran_I, bad_mask):
+        """Tophat-smooth the I map (radius post_tophat) if post_tophat > 0;
+        otherwise returns moran_I unchanged."""
+        if self.post_tophat <= 0:
+            return moran_I
+        return convolve_fft(moran_I, Tophat2DKernel(self.post_tophat),
+                             mask=bad_mask,
+                             boundary='fill',
+                             fill_value=np.nan,
+                             nan_treatment='interpolate',
+                             normalize_kernel=True,
+                             preserve_nan=True,
+                             min_wt=0.5,
+                             fft_pad=True,
+                             allow_huge=True)
+
+    def _make_source_mask(self, istat, valid, bad_mask):
+        """Threshold the (smoothed) I map into an initial boolean source
+        mask, using the percentile-based i_lower_nsigma/i_upper_nsigma
+        cut. Returns flag_as_source (True = source)."""
+        good_istat = np.isfinite(istat) & ~bad_mask
+        valid_istat = istat[good_istat]
+        p50 = np.percentile(valid_istat, 50.)
+        p16 = np.percentile(valid_istat, 16.)
+        p84 = np.percentile(valid_istat, 84.)
+        logger.debug(f"  p16, p50, p84: {p16:8.5f} {p50:8.5f} {p84:8.5f}")
+        x = (istat - p50) / ((p84 - p16) / 2.)
+        flag_as_source = valid & ((x < -self.i_lower_nsigma) | (x > self.i_upper_nsigma))
+        return flag_as_source
+
+    def _grow_source_mask(self, image, flag_as_source, bad_mask, weight=None):
+        """
+        Adaptively grow flag_as_source (True = source) using
+        gradient_grow_mask -- replaces the old dilation_tophat
+        convolution-threshold approach.
+
+        Growth uses the real (not pre/post-smoothed) image so the local
+        noise properties driving the significance test match the actual
+        pixel-to-pixel sky scatter, not a correlated, smoothed version
+        of it.
+
+        If self.block_size > 0 and self.grow_at_block_resolution is
+        True, growth runs on the block-averaged grid (block_average'd
+        `image`, block-reduced seed mask) instead of native resolution
+        -- the same cost argument that motivates block-averaging for
+        the I statistic itself -- then the grown mask is replicated
+        back to native resolution.
+        """
+        if self.block_size > 0 and self.grow_at_block_resolution:
+            return self._grow_source_mask_block(image, flag_as_source, bad_mask, weight)
+        return self._grow_source_mask_native(image, flag_as_source, bad_mask, weight)
+
+    def _grow_source_mask_native(self, image, flag_as_source, bad_mask, weight=None):
+        good_pixels = np.isfinite(image) & ~bad_mask
+        if weight is not None:
+            good_pixels &= np.isfinite(weight) & (weight > 0)
+            if self.treat_weight_as_inverse_variance:
+                sigma_pix = np.sqrt(1.0 / np.maximum(weight, 1e-12))
+            else:
+                sigma_pix = None  # falls back to a robust estimate off `image`
+        else:
+            sigma_pix = None
+
+        grown, _ = gradient_grow_mask(
+            image, flag_as_source,
+            half_size=self.grow_half_size,
+            radial_step=self.grow_radial_step,
+            k=self.grow_k,
+            max_iter=self.grow_max_iter,
+            sigma_pix=sigma_pix,
+            good_pixels=good_pixels,
+        )
+        return grown
+
+    def _grow_source_mask_block(self, image, flag_as_source, bad_mask, weight=None):
+        block = self.block_size
+
+        block_image, block_weight, block_bad, orig_shape = block_average(
+            image, block, bad_mask=bad_mask, weight=weight,
+            min_valid_frac=self.grow_min_valid_frac_block,
+        )
+
+        # Block-reduce the seed mask: a block counts as seed if it
+        # contains any source pixel (max-pool, not mean -- we don't
+        # want to require a majority of the block to already be
+        # flagged before it can seed growth).
+        padded = _pad_to_multiple(flag_as_source.astype(np.float64), block, 0.0)
+        Hp, Wp = padded.shape
+        nby, nbx = Hp // block, Wp // block
+        block_seed = padded.reshape(nby, block, nbx, block).max(axis=(1, 3)) > 0
+        block_seed &= ~block_bad  # don't seed growth from an untrustworthy block
+
+        block_good = ~block_bad
+        if weight is not None and self.treat_weight_as_inverse_variance:
+            sigma_pix = np.sqrt(1.0 / np.maximum(block_weight, 1e-12))
+        else:
+            sigma_pix = None  # falls back to a robust estimate off block_image
+
+        grow_half_size_b = max(1, round(self.grow_half_size / block))
+        grow_radial_step_b = max(1.0, self.grow_radial_step / block)
+        # each block-grid iteration advances `block` native pixels, so
+        # fewer iterations are needed to reach the same physical extent
+        grow_max_iter_b = max(1, -(-self.grow_max_iter // block))  # ceil
+        grown_block, _ = gradient_grow_mask(
+            block_image, block_seed,
+            half_size=grow_half_size_b,
+            radial_step=grow_radial_step_b,
+            k=self.grow_k,
+            max_iter=grow_max_iter_b,
+            sigma_pix=sigma_pix,
+            good_pixels=block_good,
+        )
+        grown_native = block_replicate(grown_block, block, orig_shape)
+        # a block-grown mask is at best as fine-grained as the block
+        # size, so make sure we never lose detail the native-resolution
+        # threshold step already established
+        return grown_native | flag_as_source
+
+    def _dilate_source_mask(self,image,flag_as_source,bad_mask):
+       arr = flag_as_source.astype(np.float64)
+       cmask = convolve_fft(arr, Tophat2DKernel(self.dilation_tophat),
+                         mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
+                         boundary='fill',
+                         fill_value=np.nan,       # <-- the key fix, see below
+                         nan_treatment='interpolate',
+                         normalize_kernel=True,
+                         preserve_nan=True,
+                         min_wt=0.5,
+                         fft_pad=True,
+                         allow_huge=True)
+       flag_as_source = np.where(cmask > self.dilation_threshold,True,False)
+       return flag_as_source
+
     def flag_sources(
             self,
             image: np.ndarray,
@@ -535,11 +742,10 @@ class SlidingMoranSourceFilter:
         """
          Carries out the following steps:
          - Convolves the image with a tophat of radius pre_tophat if pre_tophat > 0
-         - Compputes Moran's I, either block resampled or at the native scale depending on block size
+         - Computes Moran's I, either block resampled or at the native scale depending on block size
          - Convolves the Moran's I array with a tophat if post_tophat > 0
          - Thresholds to identify high & low values of Moran's I as sources
-         - Convolves this mask with a tophat if dilation_tophat > 0
-         - Thresholds this dilated mask to convert back to a boolean
+         - Adaptively grows the source mask via gradient significance (see grow_half_size/grow_k/grow_max_iter)
          - Returns a mask with True for background and False for source
 
         Parameters
@@ -560,103 +766,45 @@ class SlidingMoranSourceFilter:
            True for background pixels, False for source pixels
 
         """
-        # Smooth the image if desired
         if bad_mask is None:
-            bad_mask = np.zeros(image.shape,'bool')
+            bad_mask = np.zeros(image.shape, 'bool')
         else:
             bad_mask = bad_mask.astype('bool')
         valid = np.isfinite(image) & ~bad_mask
-        logger.debug(f"start")
+
+        logger.debug("start")
         start = time.time()
-        logger.debug(f"    before pre_tophat: {rss_gb()} GB")
-        if self.pre_tophat > 0:
-            #cimg = convolve_fft(image,Tophat2DKernel(self.pre_tophat),allow_huge=True)
-            cimg = convolve_fft(image, Tophat2DKernel(self.pre_tophat),
-                                mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
-                                boundary='fill',
-                                fill_value=np.nan,       # To deal with borders
-                                nan_treatment='interpolate',
-                                normalize_kernel=True,
-                                preserve_nan=True,
-                                min_wt=0.5,
-                                fft_pad=True,
-                                allow_huge=True)
-        else:
-            cimg = image
+
+        cimg = self._pre_convolve(image, bad_mask)
         logger.debug(f"    {np.median(cimg[valid & ~np.isnan(cimg)]) = }")
-        logger.debug(f"    {np.count_nonzero(np.isfinite(cimg[valid])) = }")
         logger.debug(f"    pre_convolved: time, resources: {time.time()-start}, {rss_gb()} GB")
 
-        # Compute the I statistic
-        if self.block_size > 0:
-            moransi = self.compute_block_averaged(cimg, block=self.block_size, bad_mask=bad_mask, weight=weight)
-        else:
-            moransi = self.compute(cimg, bad_mask=bad_mask, weight=weight)
-        logger.debug(f"    {np.count_nonzero(np.isfinite(moransi.I[valid])) = }")
-        logger.debug(f"    {moransi.I.min() = }, {moransi.I.max() = } {np.median(moransi.I[valid]) = }") 
+        moransi = self._compute_istat(cimg, bad_mask, weight)
+        logger.debug(f"    {moransi.I.min() = }, {moransi.I.max() = } {np.median(moransi.I[valid]) = }")
         logger.debug(f"    computed I: time, resources {time.time()-start}, {rss_gb()} GB")
 
-        # Smooth the I statistic if desired
-        if self.post_tophat > 0:
-            #istat = convolve_fft(moransi.I,Tophat2DKernel(self.post_tophat),allow_huge=True)
-            istat = convolve_fft(moransi.I, Tophat2DKernel(self.post_tophat),
-                                 mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
-                                 boundary='fill',
-                                 fill_value=np.nan,       # To deal with borders
-                                 nan_treatment='interpolate',
-                                 normalize_kernel=True,
-                                 preserve_nan=True,
-                                 min_wt=0.5,
-                                 fft_pad=True,
-                                 allow_huge=True)
-            logger.debug(f"    {np.median(istat[valid & ~np.isnan(istat)]) = }")
-        else:
-            istat = moransi.I
+        istat = self._smooth_istat(moransi.I, bad_mask)
         logger.debug(f"    post_convolved: time, resources: {time.time()-start}, {rss_gb()} GB")
 
-        # Make a source mask
-        if bad_mask is not None:
-            good_istat  = np.isfinite(istat) & ~bad_mask
-        else:
-            good_istat  = np.isfinite(istat)
-        logger.debug(f"    {good_istat.dtype = } {np.count_nonzero(good_istat) = }")
-        logger.debug(f"    Identified valid pixels: time, resources: {time.time()-start}, {rss_gb()} GB")
-        valid_istat = istat[good_istat]
-        logger.debug(f"    Selected valid pixels: time, resources: {time.time()-start}, {rss_gb()} GB")
-        p50 = np.percentile(valid_istat,50.)
-        p16 = np.percentile(valid_istat,16.)
-        p84 = np.percentile(valid_istat,84.)
-        x = (istat-p50)/((p84-p16)/2.)
-        logger.debug(f"  p16, p50, p84: {p16:8.5f} {p50:8.5f} {p84:8.5f}")
-        flag_as_source = valid & ((x < -self.i_lower_nsigma) | (x > self.i_upper_nsigma))
-        frac_tot_masked = np.count_nonzero(flag_as_source) /  len(image.flat)
-        frac_valid_masked = np.count_nonzero(flag_as_source) /  np.count_nonzero(valid)
-        logger.info(f"  percent of total masked, pre-dilation: {100*frac_tot_masked:.3f}")
-        logger.info(f"  percent of valid masked, pre-dilation: {100*frac_valid_masked:.3f}")
+        flag_as_source = self._make_source_mask(istat, valid, bad_mask)
+        frac_tot_masked = np.count_nonzero(flag_as_source) / len(image.flat)
+        frac_valid_masked = np.count_nonzero(flag_as_source) / np.count_nonzero(valid)
+        logger.info(f"  percent of total masked, pre-growth: {100*frac_tot_masked:.3f}")
+        logger.info(f"  percent of valid masked, pre-growth: {100*frac_valid_masked:.3f}")
         logger.debug(f"    Thresholded: time, resources: {time.time()-start}, {rss_gb()} GB")
 
-        # Dilate the mask, if desired
-        if self.dilation_tophat > 0:
-            arr = flag_as_source.astype(np.float64)
-            cmask = convolve_fft(arr, Tophat2DKernel(self.dilation_tophat),
-                         mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
-                         boundary='fill',
-                         fill_value=np.nan,       # <-- the key fix, see below
-                         nan_treatment='interpolate',
-                         normalize_kernel=True,
-                         preserve_nan=True,
-                         min_wt=0.5,
-                         fft_pad=True,
-                         allow_huge=True)
-            logger.debug(f"{np.median(cmask[valid & ~np.isnan(cmask)]) = }")
-            flag_as_source = np.where(cmask > self.dilation_threshold,True,False)
-        logger.debug(f"    Dilated: time, resources: {time.time()-start}, {rss_gb()} GB")
-        frac_tot_masked = np.count_nonzero(flag_as_source) /  len(image.flat)
-        frac_valid_masked = np.count_nonzero(flag_as_source) /  np.count_nonzero(valid)
-        logger.info(f"  percent of total masked, post-dilation: {100*frac_tot_masked:.3f}")
-        logger.info(f"  percent of valid masked, post-dilation: {100*frac_valid_masked:.3f}")
+        if self.grow_max_iter > 0:
+            flag_as_source = self._grow_source_mask(image, flag_as_source, bad_mask, weight=weight)
+        elif self.dilation_tophat > 0:
+            flag_as_source = self._dilate_source_mask(image, flag_as_source, bad_mask)
 
-        return ~flag_as_source,istat
+        logger.debug(f"    Grown: time, resources: {time.time()-start}, {rss_gb()} GB")
+        frac_tot_masked = np.count_nonzero(flag_as_source) / len(image.flat)
+        frac_valid_masked = np.count_nonzero(flag_as_source) / np.count_nonzero(valid)
+        logger.info(f"  percent of total masked, post-growth: {100*frac_tot_masked:.3f}")
+        logger.info(f"  percent of valid masked, post-growth: {100*frac_valid_masked:.3f}")
+
+        return ~flag_as_source, istat
 
 
 # ----------------------------------------------------------------------

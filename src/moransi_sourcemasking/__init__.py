@@ -16,8 +16,9 @@ from .tiered_sourcemask import make_sourcemask, make_individual_sourcemasks, rea
 from .block_average import (
     block_average_robust,
     noise_correlation_ratio,
-    inverse_correlation_ratio,
+    inverse_correlation_ratio
 )
+from .gradient_mask_growth import gradient_grow_mask, gradient_significance_map
 
 __all__ = [
     "SlidingMoranSourceFilter",
@@ -28,4 +29,6 @@ __all__ = [
     "block_average_robust",
     "noise_correlation_ratio",
     "inverse_correlation_ratio",
+    "gradient_grow_mask",
+    "gradient_significance_map"
 ]
