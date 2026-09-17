@@ -18,7 +18,7 @@ Masking and block-statistics tools for astronomical images:
 pip install -e .
 ```
 
-(from PyPI once published: `pip install fieldstats`)
+(from PyPI once published: `pip install moransi_sourcemasking`)
 
 ## Quick start
 
