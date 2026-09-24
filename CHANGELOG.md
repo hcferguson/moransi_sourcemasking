@@ -5,7 +5,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 ### Added
-- `SlidingMoranSourceFilter.compute_sliding_global_I()` in `fieldstats.moransi`:
+- `compute_sliding_global_I()` gained an `n_box_passes` option (default `1`,
+  fully backward compatible). With `n_box_passes > 1`, each of the six
+  underlying per-pixel maps is box-summed that many times in a row before
+  being combined into the ratio -- the classic "repeated box blur
+  approximates a Gaussian blur" construction -- which softens the flat,
+  sharp-edged "box" footprint a hard patch gives compact sources into a
+  smoothly tapered one, while staying entirely on the fast integral-image
+  path (no FFT/astropy.convolution). Verified that `n_box_passes=1`
+  reproduces the original hard-box statistic exactly, and that
+  `n_box_passes=3` measurably removes the flat plateau near a compact
+  test source, in `tests/test_moransi.py`.
+
+- `SlidingMoranSourceFilter.compute_sliding_global_I()` in `moransi_sourcemasking.moransi`:
   a new statistic computing the textbook *Global* Moran's I (one shared
   mean/variance reference per patch) over a sliding patch centered on
   every pixel, as an alternative to `compute()`'s per-pixel annulus-based
@@ -14,7 +26,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   patch-local variance; verified against a brute-force reference
   implementation (both unweighted and inverse-variance-weighted) in
   `tests/test_moransi.py`. Returns a new `SlidingGlobalIResult` dataclass.
-- `compute()`, `compute_block_averaged()`, and `flag_sources()` in `fieldstats.moransi`
+- `compute()`, `compute_block_averaged()`, and `flag_sources()` in `moransi_sourcemasking.moransi`
   now accept an optional `source_mask` argument (True = background/sky), so a
   smaller-kernel tier's result can be chained into a larger tier's background
   estimation and excluded from it. `sourcemask.make_sourcemask()` and

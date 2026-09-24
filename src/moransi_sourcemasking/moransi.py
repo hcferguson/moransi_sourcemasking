@@ -289,6 +289,35 @@ class SlidingMoranSourceFilter:
         D = integral[np.ix_(r0, c0)]
         return A - B - C + D
 
+    @classmethod
+    def _repeated_box_sum(cls, arr: np.ndarray, half: int, n_passes: int) -> np.ndarray:
+        """
+        Apply the box-sum (integral image + 4-corner lookup) `n_passes`
+        times in a row, each pass using the same `half`, each pass's
+        output feeding the next pass's integral image.
+
+        This is the classic "N passes of box blur approximate a Gaussian
+        blur" construction, applied here as a *sum* (not a per-pass
+        average) so it stays exactly linear: running it identically on
+        every numerator/denominator map in compute_sliding_global_I and
+        dividing only once at the end is mathematically equivalent to
+        having used one smoother, tapered, near-Gaussian *weight kernel*
+        for the whole patch calculation, rather than n_passes separate
+        renormalizations. n_passes=1 reduces to a single ordinary box sum
+        (byte-for-byte the same as calling _box_sum_from_integral once).
+
+        Note the effective footprint grows with n_passes at fixed `half`
+        (each pass adds reach), so this isn't a drop-in same-footprint
+        replacement for a single wider box -- it trades some extra reach
+        for a soft-edged, tapered profile instead of a hard cutoff.
+        """
+        out = arr
+        shape = arr.shape
+        for _ in range(n_passes):
+            S = cls._integral_image(out)
+            out = cls._box_sum_from_integral(S, half, shape)
+        return out
+
     def _build_integrals(self, image: np.ndarray, w_eff: np.ndarray, valid_mask: np.ndarray):
         """Precompute the four integral images (count, W, WX, WX^2) once per call."""
         cnt = valid_mask.astype(np.float64)
@@ -493,17 +522,19 @@ class SlidingMoranSourceFilter:
         self,
         image: np.ndarray,
         patch_half: Optional[int] = None,
+        n_box_passes: int = 1,
         bad_mask: Optional[np.ndarray] = None,
         weight: Optional[np.ndarray] = None,
     ) -> SlidingGlobalIResult:
         """
         Sliding-window ("moving-patch") Global Moran's I.
 
-        At every output pixel c, treats the (2*patch_half+1) x
-        (2*patch_half+1) box centered on c as its own standalone "image"
-        and computes the textbook Global Moran's I (Cliff & Ord; the
-        Wikipedia "Moran's I" definition) for that patch, using
-        row-standardized weights for the correlation kernel (corr_half).
+        At every output pixel c, treats a patch centered on c as its own
+        standalone "image" and computes the textbook Global Moran's I
+        (Cliff & Ord; the Wikipedia "Moran's I" definition) for that
+        patch, using row-standardized weights for the correlation kernel
+        (corr_half). With n_box_passes=1 (the default), that patch is a
+        hard-edged (2*patch_half+1) x (2*patch_half+1) box.
 
         This is a genuinely different statistic from compute()'s I map --
         it is *not* the same as box-averaging compute()'s per-pixel I,
@@ -538,13 +569,40 @@ class SlidingMoranSourceFilter:
         confined to pixels within corr_half of the patch boundary, and
         is negligible once patch_half >> corr_half.
 
+        A hard box patch gives compact sources a flat-topped, sharp-edged
+        "box" footprint in I (constant while the source stays anywhere
+        inside the patch, then a sudden drop once it falls outside --
+        see project notes for the derivation). n_box_passes > 1 softens
+        this: instead of a single box sum, each of the six underlying
+        per-pixel maps (weight, weight*x, weight*x^2, weight*nbr_mean,
+        weight*x*nbr_mean, and the validity count) is box-summed
+        n_box_passes times in a row -- the classic "repeated box blur
+        approximates a Gaussian blur" construction -- and only combined
+        into the final ratio once, at the end. Because every map gets the
+        identical repeated-sum treatment before dividing, this is exactly
+        equivalent to having used one smoother, tapered, near-Gaussian
+        weight kernel for the whole patch from the start, not merely a
+        cosmetic post-hoc smoothing of the resulting I map. It stays on
+        the fast integral-image path throughout -- no FFT, no
+        astropy.convolution -- costing roughly n_box_passes times a
+        single pass. Note the effective footprint grows somewhat with
+        n_box_passes at fixed patch_half (each pass adds some reach), so
+        it trades a bit of extra reach for the softer edge.
+
         Parameters
         ----------
         image : 2D array
         patch_half : int, optional
-            Half-width of the sliding patch used as the "whole image" for
-            the Global I calculation at each pixel. Defaults to
+            Half-width of the box used for the sliding Global I
+            calculation. With n_box_passes=1 this is the patch's outer
+            half-width directly; with n_box_passes>1 it's the half-width
+            used for *each* of the repeated passes. Defaults to
             self.bg_half.
+        n_box_passes : int, optional
+            Number of times to repeat the box-sum step (see above).
+            1 (default) reproduces the original hard-box statistic
+            exactly. 3 is a common choice for a good box-blur-to-Gaussian
+            approximation.
         bad_mask : 2D bool array, optional
             True where the pixel is *unusable* (e.g. `dq != 0`). NaN/inf
             pixels in `image` are treated as bad automatically.
@@ -557,6 +615,9 @@ class SlidingMoranSourceFilter:
         -------
         SlidingGlobalIResult
         """
+        if n_box_passes < 1:
+            raise ValueError(f"n_box_passes must be >= 1, got {n_box_passes}")
+
         image = np.asarray(image, dtype=np.float64)
         finite = np.isfinite(image)
 
@@ -575,8 +636,6 @@ class SlidingMoranSourceFilter:
         if patch_half is None:
             patch_half = self.bg_half
 
-        shape = image.shape
-
         # Neighbor-kernel mean at every pixel -- same row-standardized,
         # weighted quantity compute()'s I map uses as its correlation term.
         nbr_mean, _, nbr_W = self._neighbor_stats(image, weight, valid_mask)
@@ -590,19 +649,12 @@ class SlidingMoranSourceFilter:
         safe_image = np.where(combined_valid, image, 0.0)
         safe_nbr = np.where(combined_valid, nbr_mean, 0.0)
 
-        S_cnt = self._integral_image(combined_valid.astype(np.float64))
-        S_w = self._integral_image(w_eff)
-        S_wx = self._integral_image(w_eff * safe_image)
-        S_wx2 = self._integral_image(w_eff * safe_image * safe_image)
-        S_wn = self._integral_image(w_eff * safe_nbr)
-        S_wxn = self._integral_image(w_eff * safe_image * safe_nbr)
-
-        cnt = self._box_sum_from_integral(S_cnt, patch_half, shape)
-        Wsum = self._box_sum_from_integral(S_w, patch_half, shape)
-        WXsum = self._box_sum_from_integral(S_wx, patch_half, shape)
-        WX2sum = self._box_sum_from_integral(S_wx2, patch_half, shape)
-        WNsum = self._box_sum_from_integral(S_wn, patch_half, shape)
-        WXNsum = self._box_sum_from_integral(S_wxn, patch_half, shape)
+        cnt = self._repeated_box_sum(combined_valid.astype(np.float64), patch_half, n_box_passes)
+        Wsum = self._repeated_box_sum(w_eff, patch_half, n_box_passes)
+        WXsum = self._repeated_box_sum(w_eff * safe_image, patch_half, n_box_passes)
+        WX2sum = self._repeated_box_sum(w_eff * safe_image * safe_image, patch_half, n_box_passes)
+        WNsum = self._repeated_box_sum(w_eff * safe_nbr, patch_half, n_box_passes)
+        WXNsum = self._repeated_box_sum(w_eff * safe_image * safe_nbr, patch_half, n_box_passes)
 
         safe_W = np.maximum(Wsum, 1e-12)
         mu_P = WXsum / safe_W
@@ -612,8 +664,15 @@ class SlidingMoranSourceFilter:
 
         I = (xnbrbar_P - mu_P * nbrbar_P) / m2_P
 
-        outer_side = 2 * patch_half + 1
-        max_cnt = outer_side ** 2
+        # "Fully valid" reference count for the same repeated-box-sum
+        # kernel, read off an interior point far from any edge, so the
+        # min_valid_frac check generalizes correctly to n_box_passes>1
+        # (whose effective footprint isn't simply (2*patch_half+1)**2).
+        ref_side = 2 * (patch_half * n_box_passes) + 5
+        ref_ones = np.ones((ref_side, ref_side))
+        ref_smoothed = self._repeated_box_sum(ref_ones, patch_half, n_box_passes)
+        max_cnt = ref_smoothed[ref_side // 2, ref_side // 2]
+
         low_conf = cnt < (self.min_valid_frac * max_cnt)
         bad = low_conf | (Wsum <= 0) | ~valid_mask
         I = np.where(bad, np.nan, I)

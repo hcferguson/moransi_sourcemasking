@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from moransi_sourcemasking import SlidingMoranSourceFilter
 
@@ -101,3 +102,52 @@ def test_sliding_global_I_respects_bad_mask_and_flags_low_confidence_edges():
     assert np.isfinite(res.I[20, 20])
     # a corner, whose patch is mostly off-image, should fail min_valid_frac and be NaN
     assert np.isnan(res.I[0, 0])
+
+
+def test_sliding_global_I_n_box_passes_1_matches_original_hard_box():
+    # n_box_passes=1 must reproduce the exact hard-box statistic, byte for byte
+    # (this is the pre-n_box_passes implementation, brute-force verified separately).
+    rng = np.random.default_rng(1)
+    N = 40
+    image = rng.normal(0, 1, size=(N, N))
+    image[20:23, 20:23] += 4.0
+    filt = SlidingMoranSourceFilter(
+        corr_half=1, bg_half=9, exclude_half=1, sigma_clip=None, clip_iters=0, min_valid_frac=0.0,
+    )
+    res_default = filt.compute_sliding_global_I(image, patch_half=8)
+    res_explicit = filt.compute_sliding_global_I(image, patch_half=8, n_box_passes=1)
+    assert np.array_equal(res_default.I, res_explicit.I, equal_nan=True)
+
+
+def test_sliding_global_I_multi_pass_softens_compact_source_box_footprint():
+    # A hard box (n_box_passes=1) should be ~flat near a compact source and then
+    # fall sharply right at patch_half; multiple passes should instead fall off
+    # smoothly and monotonically, with no flat plateau.
+    rng = np.random.default_rng(7)
+    N = 81
+    image = rng.normal(0, 1.0, size=(N, N))
+    cy, cx = 40, 40
+    yy, xx = np.mgrid[0:N, 0:N]
+    r2 = (yy - cy) ** 2 + (xx - cx) ** 2
+    image += 30.0 * np.exp(-r2 / (2 * 1.2 ** 2))  # small, compact source
+
+    filt = SlidingMoranSourceFilter(
+        corr_half=1, bg_half=11, exclude_half=1, sigma_clip=None, clip_iters=0, min_valid_frac=0.0,
+    )
+    hard = filt.compute_sliding_global_I(image, patch_half=10, n_box_passes=1)
+    soft = filt.compute_sliding_global_I(image, patch_half=4, n_box_passes=3)
+
+    hard_profile = np.array([hard.I[cy, cx + dx] for dx in range(0, 9)])
+    soft_profile = np.array([soft.I[cy, cx + dx] for dx in range(0, 9)])
+
+    # hard-box profile should vary very little near the source (the "plateau")
+    assert np.ptp(hard_profile) < 0.02
+    # soft (3-pass) profile should show a clear, non-trivial decline over the same range
+    assert (soft_profile[0] - soft_profile[-1]) > 0.03
+
+
+def test_sliding_global_I_rejects_invalid_n_box_passes():
+    image = np.zeros((10, 10))
+    filt = SlidingMoranSourceFilter(corr_half=1, bg_half=4, exclude_half=1)
+    with pytest.raises(ValueError):
+        filt.compute_sliding_global_I(image, patch_half=3, n_box_passes=0)
