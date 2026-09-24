@@ -38,6 +38,18 @@ is independent of window size.
 Convention: `bad_mask` is True where a pixel is unusable (e.g. DQ != 0).
 Any NaN/inf pixel in the data array, or (if a weight array is given) any
 non-finite or non-positive weight, is automatically treated as bad too.
+
+A second, related statistic is also provided:
+`SlidingMoranSourceFilter.compute_sliding_global_I()` computes, at every
+pixel, the textbook *Global* Moran's I (not the local I_i above) treating
+a sliding patch centered on that pixel as its own standalone "image" --
+i.e. one shared reference mean/variance per patch, rather than the local
+I_i's per-pixel annulus reference. It reduces to a patch-local covariance
+between the image and its own neighbor-mean map, divided by the patch-local
+variance -- see that method's docstring for the derivation. Useful when the
+image is background-dominated at the patch scale (so the patch's own
+mean/variance is already a good "typical sky" reference) and you'd rather
+not maintain a separate, deliberately local background annulus.
 """
 
 from __future__ import annotations
@@ -48,8 +60,6 @@ from typing import Optional
 import numpy as np
 
 from astropy.convolution import convolve, convolve_fft, Tophat2DKernel, Gaussian2DKernel
-
-from .gradient_mask_growth import gradient_grow_mask
 
 
 ##################################################################################
@@ -74,6 +84,15 @@ class LocalMoranResult:
     bg_weight_sum: np.ndarray      # sum of weights used in the bg annulus
     neighbor_valid_count: np.ndarray   # number of valid neighbor pixels
     neighbor_weight_sum: np.ndarray    # sum of neighbor weights
+
+
+@dataclass
+class SlidingGlobalIResult:
+    I: np.ndarray                  # sliding-patch Global Moran's I, see compute_sliding_global_I
+    patch_mean: np.ndarray         # weighted patch mean, mu_P(c)
+    patch_var: np.ndarray          # weighted patch variance, m2_P(c)
+    patch_valid_count: np.ndarray  # number of valid pixels used in the patch
+    patch_weight_sum: np.ndarray   # sum of weights used in the patch
 
 
 def _pad_to_multiple(arr: np.ndarray, block: int, pad_value: float):
@@ -179,36 +198,6 @@ class SlidingMoranSourceFilter:
           (dilation) to the dilate mask (1= source, 0 = background)
     dilation_threshold : float
         Threshold to apply to the dilated mask to convert back to a boolean
-    grow_half_size : int
-        Half-size of the local linear-fit window used by the adaptive
-        gradient-significance mask growth in flag_sources (replaces the
-        old dilation_tophat convolution-threshold growth). Always
-        native-pixel scale, like corr_half/bg_half/exclude_half -- when
-        growth runs at block resolution (grow_at_block_resolution=True),
-        it is converted to block-grid units the same way those are.
-    grow_k : float
-        Significance threshold (in sigma) for the inward-gradient test
-        that drives adaptive growth -- a ring keeps growing while its
-        median z-score exceeds this.
-    grow_max_iter : int
-        Maximum number of growth iterations (in whatever grid -- native
-        or block -- growth is running on; see grow_at_block_resolution).
-    grow_at_block_resolution : bool
-        If True and block_size > 0, adaptive growth runs on the same
-        block-averaged grid used for the Moran's I computation (block-
-        averaging `image` itself, block-reducing the seed mask, growing
-        there, then replicating back to native resolution) instead of
-        at full native resolution. Much cheaper for large images /
-        large grow_half_size -- exactly the same speed argument that
-        motivates block-averaging for the I statistic itself.
-    grow_min_valid_frac_block : float
-        Only used when grow_at_block_resolution is True: passed as
-        min_valid_frac to the block_average() call on `image`.
-    treat_weight_as_inverse_variance : bool
-        If True (and a `weight` array is passed to flag_sources), use
-        sqrt(1/weight) as the per-pixel sky-noise map for the growth
-        significance test, instead of estimating a single sky sigma
-        empirically from the image.
     lower_percentile : pixels with I below this threshold are masked as "sources"
     upper_percentile : pixels with I above this threshold are masked as "sources"
     corr_half, bg_half, exclude_half : int
@@ -244,13 +233,6 @@ class SlidingMoranSourceFilter:
         post_tophat: int = 0,
         dilation_tophat: int = 0,
         dilation_threshold: int = 0.05,
-        grow_half_size: int = 8,
-        grow_radial_step: float = 1.0,
-        grow_k: float = 3.0,
-        grow_max_iter: int = 0,
-        grow_at_block_resolution: bool = True,
-        grow_min_valid_frac_block: float = 0.5,
-        treat_weight_as_inverse_variance: bool = False,
         i_lower_nsigma: float = 100,
         i_upper_nsigma: float = 10,
         block_size: int = 0,
@@ -277,13 +259,6 @@ class SlidingMoranSourceFilter:
         self.post_tophat = post_tophat
         self.dilation_tophat = dilation_tophat
         self.dilation_threshold = dilation_threshold
-        self.grow_half_size = grow_half_size
-        self.grow_radial_step = grow_radial_step
-        self.grow_k = grow_k
-        self.grow_max_iter = grow_max_iter
-        self.grow_at_block_resolution = grow_at_block_resolution
-        self.grow_min_valid_frac_block = grow_min_valid_frac_block
-        self.treat_weight_as_inverse_variance = treat_weight_as_inverse_variance
         self.i_lower_nsigma = i_lower_nsigma
         self.i_upper_nsigma = i_upper_nsigma
         self.block_size = block_size
@@ -406,6 +381,7 @@ class SlidingMoranSourceFilter:
         image: np.ndarray,
         bad_mask: Optional[np.ndarray] = None,
         weight: Optional[np.ndarray] = None,
+        source_mask: Optional[np.ndarray] = None,
     ) -> LocalMoranResult:
         """
         Compute the local Moran's I map for `image`.
@@ -421,6 +397,17 @@ class SlidingMoranSourceFilter:
             (e.g. a coadd exposure/read-noise weight map). Non-finite or
             non-positive weights are treated as bad automatically. If
             omitted, every valid pixel gets weight 1 (unweighted case).
+        source_mask : 2D bool array, optional
+            True for pixels to *keep* as background/sky when estimating the
+            local (mu_i, sigma0_i) background-annulus statistics; False to
+            exclude (e.g. pixels already flagged as sources by a smaller,
+            earlier tier, passed in so this tier's background estimate
+            isn't biased by those sources' wings). Same convention as the
+            mask `flag_sources` returns: True = background. This affects
+            *only* the background-annulus statistics -- the neighbor
+            (correlation) term, and I itself, are still evaluated at every
+            valid pixel regardless of source_mask. If omitted, every valid
+            pixel is treated as background (the original behavior).
 
         Returns
         -------
@@ -441,10 +428,22 @@ class SlidingMoranSourceFilter:
             weight = np.asarray(weight, dtype=np.float64)
             valid_mask = valid_mask & np.isfinite(weight) & (weight > 0)
 
-        logger.debug(f"    compute: {np.count_nonzero(~bad_mask) = }")
+        if source_mask is None:
+            bg_valid_mask = valid_mask
+        else:
+            source_mask = np.asarray(source_mask, dtype=bool)
+            if source_mask.shape != image.shape:
+                raise ValueError(
+                    f"source_mask shape {source_mask.shape} != image shape {image.shape}"
+                )
+            # AND, not OR: keep a pixel for background estimation only if
+            # it's both currently valid AND not a previously-flagged source.
+            bg_valid_mask = valid_mask & source_mask
+
+        logger.debug(f"    compute: {np.count_nonzero(bad_mask) if bad_mask is not None else 0 = }")
         logger.debug(f"    compute: {np.count_nonzero(valid_mask) = }")
         mu_bg, sigma0_sq_bg, bg_count, bg_Wsum, clipped_mask = self._compute_bg_stats(
-            image, weight, valid_mask
+            image, weight, bg_valid_mask
         )
         nbr_mean, nbr_cnt, nbr_W = self._neighbor_stats(image, weight, valid_mask)
 
@@ -486,6 +485,147 @@ class SlidingMoranSourceFilter:
             neighbor_weight_sum=nbr_W,
         )
 
+    # ------------------------------------------------------------------
+    # Sliding-patch Global Moran's I
+    # ------------------------------------------------------------------
+
+    def compute_sliding_global_I(
+        self,
+        image: np.ndarray,
+        patch_half: Optional[int] = None,
+        bad_mask: Optional[np.ndarray] = None,
+        weight: Optional[np.ndarray] = None,
+    ) -> SlidingGlobalIResult:
+        """
+        Sliding-window ("moving-patch") Global Moran's I.
+
+        At every output pixel c, treats the (2*patch_half+1) x
+        (2*patch_half+1) box centered on c as its own standalone "image"
+        and computes the textbook Global Moran's I (Cliff & Ord; the
+        Wikipedia "Moran's I" definition) for that patch, using
+        row-standardized weights for the correlation kernel (corr_half).
+
+        This is a genuinely different statistic from compute()'s I map --
+        it is *not* the same as box-averaging compute()'s per-pixel I,
+        because that would mix each pixel's own separately-centered
+        reference stats rather than sharing one reference across the
+        whole patch. Algebraically, the row-standardized Global I of a
+        patch P centered at c reduces (derivation: expand the product,
+        the two mu_P^2 cross-terms cancel exactly) to:
+
+            I(c) = Cov_P(x, nbr_mean) / Var_P(x)
+                 = ( <x*nbr_mean>_P - mu_P * <nbr_mean>_P ) / m2_P
+
+        i.e. the patch-local (weighted) covariance between the image and
+        its own local neighbor-mean map, divided by the patch-local
+        (weighted) variance of the image -- a moving-window correlation
+        between the image and its spatial lag. Every piece here is a
+        weighted box-average of some per-pixel map over the sliding
+        patch, so it's built entirely from the same integral-image
+        machinery used elsewhere in this class: O(1) per output pixel,
+        independent of patch_half.
+
+        Both the patch reference (mu_P, m2_P) and the neighbor-kernel
+        mean (nbr_mean) are inverse-variance weighted if `weight` is
+        given, consistent with compute()'s weighting convention.
+
+        Note this uses each pixel's *ordinary* (full-image) neighbor
+        mean, not one whose neighbor kernel is truncated at the patch
+        boundary -- the latter would be the literal "patch as a
+        completely separate image" statistic, but isn't expressible as a
+        fixed set of box-sums (the truncation itself would need to slide
+        with c). The difference is a small, controlled edge effect
+        confined to pixels within corr_half of the patch boundary, and
+        is negligible once patch_half >> corr_half.
+
+        Parameters
+        ----------
+        image : 2D array
+        patch_half : int, optional
+            Half-width of the sliding patch used as the "whole image" for
+            the Global I calculation at each pixel. Defaults to
+            self.bg_half.
+        bad_mask : 2D bool array, optional
+            True where the pixel is *unusable* (e.g. `dq != 0`). NaN/inf
+            pixels in `image` are treated as bad automatically.
+        weight : 2D array, optional
+            Per-pixel weight, treated as proportional to inverse variance.
+            Non-finite or non-positive weights are treated as bad
+            automatically. If omitted, every valid pixel gets weight 1.
+
+        Returns
+        -------
+        SlidingGlobalIResult
+        """
+        image = np.asarray(image, dtype=np.float64)
+        finite = np.isfinite(image)
+
+        if bad_mask is None:
+            valid_mask = finite
+        else:
+            bad_mask = np.asarray(bad_mask, dtype=bool)
+            valid_mask = finite & ~bad_mask
+
+        if weight is None:
+            weight = np.ones_like(image)
+        else:
+            weight = np.asarray(weight, dtype=np.float64)
+            valid_mask = valid_mask & np.isfinite(weight) & (weight > 0)
+
+        if patch_half is None:
+            patch_half = self.bg_half
+
+        shape = image.shape
+
+        # Neighbor-kernel mean at every pixel -- same row-standardized,
+        # weighted quantity compute()'s I map uses as its correlation term.
+        nbr_mean, _, nbr_W = self._neighbor_stats(image, weight, valid_mask)
+        nbr_ok = np.isfinite(nbr_mean) & (nbr_W > 0)
+
+        # A pixel only contributes to the patch sums if it's valid AND has
+        # a usable neighbor mean, so every box-sum below shares the same
+        # effective-weight map -- numerator and denominator stay consistent.
+        combined_valid = valid_mask & nbr_ok
+        w_eff = np.where(combined_valid, weight, 0.0)
+        safe_image = np.where(combined_valid, image, 0.0)
+        safe_nbr = np.where(combined_valid, nbr_mean, 0.0)
+
+        S_cnt = self._integral_image(combined_valid.astype(np.float64))
+        S_w = self._integral_image(w_eff)
+        S_wx = self._integral_image(w_eff * safe_image)
+        S_wx2 = self._integral_image(w_eff * safe_image * safe_image)
+        S_wn = self._integral_image(w_eff * safe_nbr)
+        S_wxn = self._integral_image(w_eff * safe_image * safe_nbr)
+
+        cnt = self._box_sum_from_integral(S_cnt, patch_half, shape)
+        Wsum = self._box_sum_from_integral(S_w, patch_half, shape)
+        WXsum = self._box_sum_from_integral(S_wx, patch_half, shape)
+        WX2sum = self._box_sum_from_integral(S_wx2, patch_half, shape)
+        WNsum = self._box_sum_from_integral(S_wn, patch_half, shape)
+        WXNsum = self._box_sum_from_integral(S_wxn, patch_half, shape)
+
+        safe_W = np.maximum(Wsum, 1e-12)
+        mu_P = WXsum / safe_W
+        m2_P = np.maximum(WX2sum / safe_W - mu_P ** 2, self.std_floor ** 2)
+        nbrbar_P = WNsum / safe_W
+        xnbrbar_P = WXNsum / safe_W
+
+        I = (xnbrbar_P - mu_P * nbrbar_P) / m2_P
+
+        outer_side = 2 * patch_half + 1
+        max_cnt = outer_side ** 2
+        low_conf = cnt < (self.min_valid_frac * max_cnt)
+        bad = low_conf | (Wsum <= 0) | ~valid_mask
+        I = np.where(bad, np.nan, I)
+
+        return SlidingGlobalIResult(
+            I=I,
+            patch_mean=mu_P,
+            patch_var=m2_P,
+            patch_valid_count=cnt,
+            patch_weight_sum=Wsum,
+        )
+
     def _scale_params_to_block(self, block: int):
         """
         Convert the instance's native-pixel corr_half/bg_half/exclude_half
@@ -505,7 +645,9 @@ class SlidingMoranSourceFilter:
         block: int,
         bad_mask: Optional[np.ndarray] = None,
         weight: Optional[np.ndarray] = None,
+        source_mask: Optional[np.ndarray] = None,
         min_valid_frac_block: float = 0.5,
+        source_frac_threshold: float = 1.0,
         replicate: bool = True,
         verbose: bool = True,
     ) -> LocalMoranResult:
@@ -531,6 +673,18 @@ class SlidingMoranSourceFilter:
         The coarse-grid I map is blocky (piecewise constant over each
         block) after replication -- fine for masking, but note it if you
         need a smooth map.
+
+        source_mask : 2D bool array, optional
+            Native-resolution mask, same convention as compute() (True =
+            background), typically the output of a smaller/earlier tier's
+            flag_sources(). It's downsampled to the coarse block grid
+            before being handed to the coarse compute(): a coarse block
+            counts as background only if the fraction of native background
+            pixels within it is >= source_frac_threshold. The default of
+            1.0 is conservative -- any block that straddles a source is
+            itself excluded from the coarse background estimate, so it
+            can't be contaminated by the source's wings; loosen it toward
+            0.5 if that ends up excluding too much near-source area.
         """
         corr_half_b, bg_half_b, exclude_half_b = self._scale_params_to_block(block)
         logger.debug(
@@ -553,7 +707,28 @@ class SlidingMoranSourceFilter:
         block_image, block_weight, block_bad, orig_shape = block_average(
             image, block, bad_mask=bad_mask, weight=weight, min_valid_frac=min_valid_frac_block
         )
-        coarse = coarse_filt.compute(block_image, bad_mask=block_bad, weight=block_weight)
+
+        if source_mask is None:
+            block_source_mask = None
+        else:
+            source_mask = np.asarray(source_mask, dtype=bool)
+            if source_mask.shape != image.shape:
+                raise ValueError(
+                    f"source_mask shape {source_mask.shape} != image shape {image.shape}"
+                )
+            # Downsample the native-resolution source_mask to the coarse
+            # grid by taking the per-block fraction of background pixels
+            # (reusing block_average as a plain block-mean; min_valid_frac=0
+            # here just means "don't additionally flag blocks bad", since
+            # block_bad from the image itself already covers that).
+            block_sky_frac, _, _, _ = block_average(
+                source_mask.astype(np.float64), block, min_valid_frac=0.0
+            )
+            block_source_mask = block_sky_frac >= source_frac_threshold
+
+        coarse = coarse_filt.compute(
+            block_image, bad_mask=block_bad, weight=block_weight, source_mask=block_source_mask
+        )
 
         if not replicate:
             return coarse
@@ -571,181 +746,22 @@ class SlidingMoranSourceFilter:
             neighbor_weight_sum=rep(coarse.neighbor_weight_sum),
         )
 
-    # ------------------------------------------------------------------
-    # flag_sources, broken into its constituent steps
-    # ------------------------------------------------------------------
-
-    def _pre_convolve(self, image, bad_mask):
-        """Tophat-smooth `image` (radius pre_tophat) before computing
-        Moran's I, if pre_tophat > 0; otherwise returns image unchanged."""
-        if self.pre_tophat <= 0:
-            return image
-        return convolve_fft(image, Tophat2DKernel(self.pre_tophat),
-                             mask=bad_mask,
-                             boundary='fill',
-                             fill_value=np.nan,
-                             nan_treatment='interpolate',
-                             normalize_kernel=True,
-                             preserve_nan=True,
-                             min_wt=0.5,
-                             fft_pad=True,
-                             allow_huge=True)
-
-    def _compute_istat(self, cimg, bad_mask, weight):
-        """Compute Moran's I, block-averaged or native-scale depending
-        on self.block_size. Returns the LocalMoranResult."""
-        if self.block_size > 0:
-            return self.compute_block_averaged(cimg, block=self.block_size,
-                                                bad_mask=bad_mask, weight=weight)
-        return self.compute(cimg, bad_mask=bad_mask, weight=weight)
-
-    def _smooth_istat(self, moran_I, bad_mask):
-        """Tophat-smooth the I map (radius post_tophat) if post_tophat > 0;
-        otherwise returns moran_I unchanged."""
-        if self.post_tophat <= 0:
-            return moran_I
-        return convolve_fft(moran_I, Tophat2DKernel(self.post_tophat),
-                             mask=bad_mask,
-                             boundary='fill',
-                             fill_value=np.nan,
-                             nan_treatment='interpolate',
-                             normalize_kernel=True,
-                             preserve_nan=True,
-                             min_wt=0.5,
-                             fft_pad=True,
-                             allow_huge=True)
-
-    def _make_source_mask(self, istat, valid, bad_mask):
-        """Threshold the (smoothed) I map into an initial boolean source
-        mask, using the percentile-based i_lower_nsigma/i_upper_nsigma
-        cut. Returns flag_as_source (True = source)."""
-        good_istat = np.isfinite(istat) & ~bad_mask
-        valid_istat = istat[good_istat]
-        p50 = np.percentile(valid_istat, 50.)
-        p16 = np.percentile(valid_istat, 16.)
-        p84 = np.percentile(valid_istat, 84.)
-        logger.debug(f"  p16, p50, p84: {p16:8.5f} {p50:8.5f} {p84:8.5f}")
-        x = (istat - p50) / ((p84 - p16) / 2.)
-        flag_as_source = valid & ((x < -self.i_lower_nsigma) | (x > self.i_upper_nsigma))
-        return flag_as_source
-
-    def _grow_source_mask(self, image, flag_as_source, bad_mask, weight=None):
-        """
-        Adaptively grow flag_as_source (True = source) using
-        gradient_grow_mask -- replaces the old dilation_tophat
-        convolution-threshold approach.
-
-        Growth uses the real (not pre/post-smoothed) image so the local
-        noise properties driving the significance test match the actual
-        pixel-to-pixel sky scatter, not a correlated, smoothed version
-        of it.
-
-        If self.block_size > 0 and self.grow_at_block_resolution is
-        True, growth runs on the block-averaged grid (block_average'd
-        `image`, block-reduced seed mask) instead of native resolution
-        -- the same cost argument that motivates block-averaging for
-        the I statistic itself -- then the grown mask is replicated
-        back to native resolution.
-        """
-        if self.block_size > 0 and self.grow_at_block_resolution:
-            return self._grow_source_mask_block(image, flag_as_source, bad_mask, weight)
-        return self._grow_source_mask_native(image, flag_as_source, bad_mask, weight)
-
-    def _grow_source_mask_native(self, image, flag_as_source, bad_mask, weight=None):
-        good_pixels = np.isfinite(image) & ~bad_mask
-        if weight is not None:
-            good_pixels &= np.isfinite(weight) & (weight > 0)
-            if self.treat_weight_as_inverse_variance:
-                sigma_pix = np.sqrt(1.0 / np.maximum(weight, 1e-12))
-            else:
-                sigma_pix = None  # falls back to a robust estimate off `image`
-        else:
-            sigma_pix = None
-
-        grown, _ = gradient_grow_mask(
-            image, flag_as_source,
-            half_size=self.grow_half_size,
-            radial_step=self.grow_radial_step,
-            k=self.grow_k,
-            max_iter=self.grow_max_iter,
-            sigma_pix=sigma_pix,
-            good_pixels=good_pixels,
-        )
-        return grown
-
-    def _grow_source_mask_block(self, image, flag_as_source, bad_mask, weight=None):
-        block = self.block_size
-
-        block_image, block_weight, block_bad, orig_shape = block_average(
-            image, block, bad_mask=bad_mask, weight=weight,
-            min_valid_frac=self.grow_min_valid_frac_block,
-        )
-
-        # Block-reduce the seed mask: a block counts as seed if it
-        # contains any source pixel (max-pool, not mean -- we don't
-        # want to require a majority of the block to already be
-        # flagged before it can seed growth).
-        padded = _pad_to_multiple(flag_as_source.astype(np.float64), block, 0.0)
-        Hp, Wp = padded.shape
-        nby, nbx = Hp // block, Wp // block
-        block_seed = padded.reshape(nby, block, nbx, block).max(axis=(1, 3)) > 0
-        block_seed &= ~block_bad  # don't seed growth from an untrustworthy block
-
-        block_good = ~block_bad
-        if weight is not None and self.treat_weight_as_inverse_variance:
-            sigma_pix = np.sqrt(1.0 / np.maximum(block_weight, 1e-12))
-        else:
-            sigma_pix = None  # falls back to a robust estimate off block_image
-
-        grow_half_size_b = max(1, round(self.grow_half_size / block))
-        grow_radial_step_b = max(1.0, self.grow_radial_step / block)
-        # each block-grid iteration advances `block` native pixels, so
-        # fewer iterations are needed to reach the same physical extent
-        grow_max_iter_b = max(1, -(-self.grow_max_iter // block))  # ceil
-        grown_block, _ = gradient_grow_mask(
-            block_image, block_seed,
-            half_size=grow_half_size_b,
-            radial_step=grow_radial_step_b,
-            k=self.grow_k,
-            max_iter=grow_max_iter_b,
-            sigma_pix=sigma_pix,
-            good_pixels=block_good,
-        )
-        grown_native = block_replicate(grown_block, block, orig_shape)
-        # a block-grown mask is at best as fine-grained as the block
-        # size, so make sure we never lose detail the native-resolution
-        # threshold step already established
-        return grown_native | flag_as_source
-
-    def _dilate_source_mask(self,image,flag_as_source,bad_mask):
-       arr = flag_as_source.astype(np.float64)
-       cmask = convolve_fft(arr, Tophat2DKernel(self.dilation_tophat),
-                         mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
-                         boundary='fill',
-                         fill_value=np.nan,       # <-- the key fix, see below
-                         nan_treatment='interpolate',
-                         normalize_kernel=True,
-                         preserve_nan=True,
-                         min_wt=0.5,
-                         fft_pad=True,
-                         allow_huge=True)
-       flag_as_source = np.where(cmask > self.dilation_threshold,True,False)
-       return flag_as_source
-
     def flag_sources(
             self,
             image: np.ndarray,
             bad_mask: Optional[np.ndarray] = None,
             weight: Optional[np.ndarray] = None,
+            source_mask: Optional[np.ndarray] = None,
 
     ) -> np.ndarray:
         """
          Carries out the following steps:
          - Convolves the image with a tophat of radius pre_tophat if pre_tophat > 0
-         - Computes Moran's I, either block resampled or at the native scale depending on block size
+         - Compputes Moran's I, either block resampled or at the native scale depending on block size
          - Convolves the Moran's I array with a tophat if post_tophat > 0
          - Thresholds to identify high & low values of Moran's I as sources
-         - Adaptively grows the source mask via gradient significance (see grow_half_size/grow_k/grow_max_iter)
+         - Convolves this mask with a tophat if dilation_tophat > 0
+         - Thresholds this dilated mask to convert back to a boolean
          - Returns a mask with True for background and False for source
 
         Parameters
@@ -759,6 +775,14 @@ class SlidingMoranSourceFilter:
             (e.g. a coadd exposure/read-noise weight map). Non-finite or
             non-positive weights are treated as bad automatically. If
             omitted, every valid pixel gets weight 1 (unweighted case).
+        source_mask : 2D bool array, optional
+            True for background/sky pixels, False for already-flagged
+            sources -- same convention this method returns. Pass in a
+            smaller/earlier tier's result here so *this* tier's background
+            statistics aren't biased by sources that tier already found.
+            Only affects background-annulus estimation, not which pixels
+            are eligible to be flagged here. If omitted, every valid pixel
+            is treated as background (the original, single-tier behavior).
 
         Returns
         -------
@@ -766,45 +790,105 @@ class SlidingMoranSourceFilter:
            True for background pixels, False for source pixels
 
         """
+        # Smooth the image if desired
         if bad_mask is None:
-            bad_mask = np.zeros(image.shape, 'bool')
+            bad_mask = np.zeros(image.shape,'bool')
         else:
             bad_mask = bad_mask.astype('bool')
         valid = np.isfinite(image) & ~bad_mask
-
-        logger.debug("start")
+        logger.debug(f"start")
         start = time.time()
-
-        cimg = self._pre_convolve(image, bad_mask)
+        logger.debug(f"    before pre_tophat: {rss_gb()} GB")
+        if self.pre_tophat > 0:
+            #cimg = convolve_fft(image,Tophat2DKernel(self.pre_tophat),allow_huge=True)
+            cimg = convolve_fft(image, Tophat2DKernel(self.pre_tophat),
+                                mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
+                                boundary='fill',
+                                fill_value=np.nan,       # To deal with borders
+                                nan_treatment='interpolate',
+                                normalize_kernel=True,
+                                preserve_nan=True,
+                                min_wt=0.5,
+                                fft_pad=True,
+                                allow_huge=True)
+        else:
+            cimg = image
         logger.debug(f"    {np.median(cimg[valid & ~np.isnan(cimg)]) = }")
+        logger.debug(f"    {np.count_nonzero(np.isfinite(cimg[valid])) = }")
         logger.debug(f"    pre_convolved: time, resources: {time.time()-start}, {rss_gb()} GB")
 
-        moransi = self._compute_istat(cimg, bad_mask, weight)
-        logger.debug(f"    {moransi.I.min() = }, {moransi.I.max() = } {np.median(moransi.I[valid]) = }")
+        # Compute the I statistic
+        if self.block_size > 0:
+            moransi = self.compute_block_averaged(
+                cimg, block=self.block_size, bad_mask=bad_mask, weight=weight, source_mask=source_mask
+            )
+        else:
+            moransi = self.compute(cimg, bad_mask=bad_mask, weight=weight, source_mask=source_mask)
+        logger.debug(f"    {np.count_nonzero(np.isfinite(moransi.I[valid])) = }")
+        logger.debug(f"    {moransi.I.min() = }, {moransi.I.max() = } {np.median(moransi.I[valid]) = }") 
         logger.debug(f"    computed I: time, resources {time.time()-start}, {rss_gb()} GB")
 
-        istat = self._smooth_istat(moransi.I, bad_mask)
+        # Smooth the I statistic if desired
+        if self.post_tophat > 0:
+            #istat = convolve_fft(moransi.I,Tophat2DKernel(self.post_tophat),allow_huge=True)
+            istat = convolve_fft(moransi.I, Tophat2DKernel(self.post_tophat),
+                                 mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
+                                 boundary='fill',
+                                 fill_value=np.nan,       # To deal with borders
+                                 nan_treatment='interpolate',
+                                 normalize_kernel=True,
+                                 preserve_nan=True,
+                                 min_wt=0.5,
+                                 fft_pad=True,
+                                 allow_huge=True)
+            logger.debug(f"    {np.median(istat[valid & ~np.isnan(istat)]) = }")
+        else:
+            istat = moransi.I
         logger.debug(f"    post_convolved: time, resources: {time.time()-start}, {rss_gb()} GB")
 
-        flag_as_source = self._make_source_mask(istat, valid, bad_mask)
-        frac_tot_masked = np.count_nonzero(flag_as_source) / len(image.flat)
-        frac_valid_masked = np.count_nonzero(flag_as_source) / np.count_nonzero(valid)
-        logger.info(f"  percent of total masked, pre-growth: {100*frac_tot_masked:.3f}")
-        logger.info(f"  percent of valid masked, pre-growth: {100*frac_valid_masked:.3f}")
+        # Make a source mask
+        if bad_mask is not None:
+            good_istat  = np.isfinite(istat) & ~bad_mask
+        else:
+            good_istat  = np.isfinite(istat)
+        logger.debug(f"    {good_istat.dtype = } {np.count_nonzero(good_istat) = }")
+        logger.debug(f"    Identified valid pixels: time, resources: {time.time()-start}, {rss_gb()} GB")
+        valid_istat = istat[good_istat]
+        logger.debug(f"    Selected valid pixels: time, resources: {time.time()-start}, {rss_gb()} GB")
+        p50 = np.percentile(valid_istat,50.)
+        p16 = np.percentile(valid_istat,16.)
+        p84 = np.percentile(valid_istat,84.)
+        x = (istat-p50)/((p84-p16)/2.)
+        logger.debug(f"  p16, p50, p84: {p16:8.5f} {p50:8.5f} {p84:8.5f}")
+        flag_as_source = valid & ((x < -self.i_lower_nsigma) | (x > self.i_upper_nsigma))
+        frac_tot_masked = np.count_nonzero(flag_as_source) /  len(image.flat)
+        frac_valid_masked = np.count_nonzero(flag_as_source) /  np.count_nonzero(valid)
+        logger.info(f"  percent of total masked, pre-dilation: {100*frac_tot_masked:.3f}")
+        logger.info(f"  percent of valid masked, pre-dilation: {100*frac_valid_masked:.3f}")
         logger.debug(f"    Thresholded: time, resources: {time.time()-start}, {rss_gb()} GB")
 
-        if self.grow_max_iter > 0:
-            flag_as_source = self._grow_source_mask(image, flag_as_source, bad_mask, weight=weight)
-        elif self.dilation_tophat > 0:
-            flag_as_source = self._dilate_source_mask(image, flag_as_source, bad_mask)
+        # Dilate the mask, if desired
+        if self.dilation_tophat > 0:
+            arr = flag_as_source.astype(np.float64)
+            cmask = convolve_fft(arr, Tophat2DKernel(self.dilation_tophat),
+                         mask=bad_mask,     # True = bad/invalid pixel, excluded from the convolution
+                         boundary='fill',
+                         fill_value=np.nan,       # <-- the key fix, see below
+                         nan_treatment='interpolate',
+                         normalize_kernel=True,
+                         preserve_nan=True,
+                         min_wt=0.5,
+                         fft_pad=True,
+                         allow_huge=True)
+            logger.debug(f"{np.median(cmask[valid & ~np.isnan(cmask)]) = }")
+            flag_as_source = np.where(cmask > self.dilation_threshold,True,False)
+        logger.debug(f"    Dilated: time, resources: {time.time()-start}, {rss_gb()} GB")
+        frac_tot_masked = np.count_nonzero(flag_as_source) /  len(image.flat)
+        frac_valid_masked = np.count_nonzero(flag_as_source) /  np.count_nonzero(valid)
+        logger.info(f"  percent of total masked, post-dilation: {100*frac_tot_masked:.3f}")
+        logger.info(f"  percent of valid masked, post-dilation: {100*frac_valid_masked:.3f}")
 
-        logger.debug(f"    Grown: time, resources: {time.time()-start}, {rss_gb()} GB")
-        frac_tot_masked = np.count_nonzero(flag_as_source) / len(image.flat)
-        frac_valid_masked = np.count_nonzero(flag_as_source) / np.count_nonzero(valid)
-        logger.info(f"  percent of total masked, post-growth: {100*frac_tot_masked:.3f}")
-        logger.info(f"  percent of valid masked, post-growth: {100*frac_valid_masked:.3f}")
-
-        return ~flag_as_source, istat
+        return ~flag_as_source,istat
 
 
 # ----------------------------------------------------------------------
@@ -829,4 +913,13 @@ class SlidingMoranSourceFilter:
 #       sci_array, block=5, bad_mask=bad_mask, weight=weight_array,
 #   )
 #   source_mask_ba = filt.flag_sources(result_ba, i_thresh=2.0)
+#
+#   # Sliding-patch Global Moran's I: one shared reference per patch,
+#   # rather than compute()'s per-pixel annulus reference. Good for
+#   # background-dominated fields where a patch's own mean/variance is
+#   # already a solid "typical sky" reference.
+#   result_g = filt.compute_sliding_global_I(sci_array, patch_half=10, weight=weight_array)
+#   # result_g.I is a map of the sliding Global I statistic; threshold it
+#   # the same way you would compute()'s I map (e.g. relative to its own
+#   # whole-image percentiles) to get a source mask.
 # ----------------------------------------------------------------------
