@@ -731,24 +731,24 @@ class SlidingMoranSourceFilter:
 def read_config(config):
     """Return a dict from a YAML path or a mapping."""
     if isinstance(config, Mapping):
-        config = Box(dict(config))  # shallow copy so callers' dicts aren't mutated
-        return config
+        pars = Box(dict(config))  # shallow copy so callers' dicts aren't mutated
+        return pars
     if isinstance(config, (str, PathLike)):
         with open(Path(config)) as f:
-            config = yaml.safe_load(f) or {}
-            config = Box(config)
-            return config
+            pars = yaml.safe_load(f) or {}
+            pars = Box(config)
+            return pars
     raise TypeError(
         f"config must be a path or a mapping, not {type(config).__name__}"
     )
 
-def make_sourcemask(image,config,bad_mask=None,weight=None):
+def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
     ''' Make a source mask, applying all the tiers
 
         Parameters
         ----------
         image : 2D array
-        config : a path to a yaml file or a dictionary of control parameters
+        pars : a path to a yaml file or a dictionary of control parameters
         bad_mask : 2D bool array, optional
             True where the pixel is *unusable* (e.g. `dq != 0`). NaN/inf
             pixels in `image` are treated as bad automatically.
@@ -763,12 +763,42 @@ def make_sourcemask(image,config,bad_mask=None,weight=None):
         source mask (OR of all the tiers)
     '''
 
-    # Assume all pixels are background to start
-    mask = np.ones(image.shape,dtype='bool')
+    # Set up
 
-    # Loop through the tiers
-    config = read_config(configfile)
+    # Default parameters
+    if pars is None:
+        config = yaml.safe_load(
+           ```---
+              # These are the three parameters that really matter for global I source masking
+              kernel_width:          3  # This kernel is a 3x3 box with a 0 in the center
+              patch_size:           20  # This is the patch full width in pixels
+              n_box_passes:          1  # Boxcar smooth the I statistic array before thresholding
+              opening_iterations:    2  # Remove small disconnected sources in the mask
+              threshold_type: "I value" # "I value" or "percentage"
+              threshold_value:    0.30  # Threshold in percent or in I value (30-40% or I=0.3-0.4 generally work)
+              
+               # The source masking seems to be working fine with no convolution, dilation or block averaging
+              dilation_tophat:    0  # Don't dilate
+              pre_tophat:         0
+              post_tophat:        0
+              dilation_tophat:    0  # Don't dilate
+              dilation_tophat:    0
+              block_size:         0
+              
+               # For sigma clipping when computing the standard deviation in the patch 
+              sigma_clip:       3.0
+              clip_iters:         2
+           ```
+        config = Box(config)
+
+    # Otherwise take the parameters from an input dictionary or read from a yaml file
+    else:
+        config = read_config(pars)
+
+    # Compute the sliding Global I statistic
     filt = SlidingMoranSourceFilter(**config)
+
+    # Mask the image
     mask, istat = filt.flag_sources(image,bad_mask=bad_mask,weight=weight)
     return mask
 
