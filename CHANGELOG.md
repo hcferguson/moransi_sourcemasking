@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+### Refactored
+- Removed the computation of the local Moran's I statistic and the tiered
+  source masking. The global_I algorithm works at least as well without
+  basically only one tuning parameter.
+
 ### Added
 - `compute_sliding_global_I()` gained an `n_box_passes` option (default `1`,
   fully backward compatible). With `n_box_passes > 1`, each of the six

@@ -11,7 +11,7 @@ except PackageNotFoundError:
 
 __author__ = "Henry C. ferguson"   
 
-from .moransi import SlidingMoranSourceFilter, LocalMoranResult, SlidingGlobalIResult
+from .moransi import SlidingMoranSourceFilter, SlidingGlobalIResult
 from .tiered_sourcemask import make_sourcemask, make_individual_sourcemasks, read_config
 from .block_average import (
     block_average_robust,
@@ -22,7 +22,6 @@ from .gradient_mask_growth import gradient_grow_mask, gradient_significance_map
 
 __all__ = [
     "SlidingMoranSourceFilter",
-    "LocalMoranResult",
     "SlidingGlobalIResult",
     "make_sourcemask",
     "make_individual_sourcemasks",

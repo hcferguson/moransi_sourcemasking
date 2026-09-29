@@ -1,24 +1,55 @@
 """
-Moran's I spatial-autocorrelation statistic, with optional inverse-
-variance pixel weighting for coadded images.
+Local (sliding-window) Moran's I spatial-autocorrelation statistic, with
+optional inverse-variance pixel weighting for coadded images.
 
-The global Moran's I statistic is described in a Wikipedia article.
-https://en.wikipedia.org/wiki/Moran%27s_I.
+For every pixel i, computes:
 
-This routine slides a patch of width patch_size across the image, computing
-the Global Moran's I statistic for each patch. The kernel has a width
-kernel_width (must be odd), that gives the dimensions of a fully connected
-square kernel with a 0 in the central pixel. This is used together the
-input weight array (if provided) to weight the fluxes in each pixel when
-computing the I statistic.
+    z_center = (x_i - mu_i) / sigma0_i
+    z_nbr    = (weighted neighbor mean - mu_i) / sigma0_i
+    I_i      = z_center * z_nbr
 
-There is the option to pass in a mask. Masked pixels are ignored in calculating
-the I statistic for the patch. Patches are rejected (NaNs) if too few pixels
-remain. 
+This is a local spatial-autocorrelation statistic, not a background
+subtraction or detection/SNR statistic: mu_i and sigma0_i (a single shared
+reference mean and standard deviation, estimated from the outer annulus)
+are used only to standardize deviations onto a common scale -- "what would
+this kernel's pixels look like if they had roughly the same standard
+deviation as the pixels in the outer annulus." Both the center pixel and
+the neighbor-mean term are divided by that *same* sigma0_i; neither term is
+further rescaled by its own sampling precision. That symmetry is what keeps
+I_i a correlation-type quantity (large when a pixel's deviation and its
+neighbors' typical deviation move together) rather than a significance test
+of whether the neighbor mean differs from the background.
+
+Weighting enters in two places only:
+  - mu_i and sigma0_i are a weighted mean and weighted (reduced-chi-square)
+    variance over the annulus, so noisier/less-exposed annulus pixels
+    contribute less and the reference scale self-calibrates if the weight
+    map's absolute normalization is only "roughly" proportional to inverse
+    variance (e.g. it omits sky Poisson noise, or resampling in a drizzled
+    coadd correlates/inflates the true variance).
+  - the neighbor mean itself is a weighted mean of the kernel's neighbor
+    pixels, so a low-weight neighbor counts for less in forming the
+    neighbor consensus value.
+
+All windowed sums are computed via summed-area tables (integral images),
+fully vectorized over the whole image -- no per-pixel Python loop, and cost
+is independent of window size.
 
 Convention: `bad_mask` is True where a pixel is unusable (e.g. DQ != 0).
 Any NaN/inf pixel in the data array, or (if a weight array is given) any
 non-finite or non-positive weight, is automatically treated as bad too.
+
+A second, related statistic is also provided:
+`SlidingMoranSourceFilter.compute_sliding_global_I()` computes, at every
+pixel, the textbook *Global* Moran's I (not the local I_i above) treating
+a sliding patch centered on that pixel as its own standalone "image" --
+i.e. one shared reference mean/variance per patch, rather than the local
+I_i's per-pixel annulus reference. It reduces to a patch-local covariance
+between the image and its own neighbor-mean map, divided by the patch-local
+variance -- see that method's docstring for the derivation. Useful when the
+image is background-dominated at the patch scale (so the patch's own
+mean/variance is already a good "typical sky" reference) and you'd rather
+not maintain a separate, deliberately local background annulus.
 """
 
 from __future__ import annotations
@@ -41,6 +72,19 @@ logger = logging.getLogger(__name__)
 def rss_gb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9  # macOS: bytes -> GB
 ##################################################################################
+
+@dataclass
+class LocalMoranResult:
+    I: np.ndarray                  # local Moran's I map
+    z_center: np.ndarray           # standardized center-pixel deviation
+    z_neighbor_mean: np.ndarray    # standardized neighbor-mean deviation
+    bg_mean: np.ndarray            # local (weighted) background mean, mu_i
+    bg_scale: np.ndarray           # local reference noise scale, sigma0_i (sqrt of the reduced-chi-square factor)
+    bg_valid_count: np.ndarray     # number of valid pixels used in the bg annulus
+    bg_weight_sum: np.ndarray      # sum of weights used in the bg annulus
+    neighbor_valid_count: np.ndarray   # number of valid neighbor pixels
+    neighbor_weight_sum: np.ndarray    # sum of neighbor weights
+
 
 @dataclass
 class SlidingGlobalIResult:
@@ -189,18 +233,24 @@ class SlidingMoranSourceFilter:
         post_tophat: int = 0,
         dilation_tophat: int = 0,
         dilation_threshold: int = 0.05,
+        i_lower_nsigma: float = 100,
+        i_upper_nsigma: float = 10,
         block_size: int = 0,
-        kernel_width: int = 3,
-        patch_size: int = 10,
+        corr_half: int = 1,
+        bg_half: int = 10,
+        exclude_half: int = 3,
         sigma_clip: Optional[float] = 3.0,
         clip_iters: int = 2,
         std_floor: float = 1e-6,
         min_valid_frac: float = 0.3,
     ):
-        if patch_size <= kernel_width:
-            raise ValueError("patch_size must be larger than kernel_widthf")
-        self.corr_half = kernel_width // 2
-        self.bg_half = patch_size // 2
+        if exclude_half < corr_half:
+            raise ValueError("exclude_half should be >= corr_half")
+        if bg_half <= exclude_half:
+            raise ValueError("bg_half must be larger than exclude_half")
+        self.corr_half = corr_half
+        self.bg_half = bg_half
+        self.exclude_half = exclude_half
         self.sigma_clip = sigma_clip
         self.clip_iters = clip_iters
         self.std_floor = std_floor
@@ -209,6 +259,8 @@ class SlidingMoranSourceFilter:
         self.post_tophat = post_tophat
         self.dilation_tophat = dilation_tophat
         self.dilation_threshold = dilation_threshold
+        self.i_lower_nsigma = i_lower_nsigma
+        self.i_upper_nsigma = i_upper_nsigma
         self.block_size = block_size
 
     # ------------------------------------------------------------------
@@ -351,6 +403,119 @@ class SlidingMoranSourceFilter:
 
     # ------------------------------------------------------------------
     # Public API
+    # ------------------------------------------------------------------
+
+    def compute(
+        self,
+        image: np.ndarray,
+        bad_mask: Optional[np.ndarray] = None,
+        weight: Optional[np.ndarray] = None,
+        source_mask: Optional[np.ndarray] = None,
+    ) -> LocalMoranResult:
+        """
+        Compute the local Moran's I map for `image`.
+
+        Parameters
+        ----------
+        image : 2D array
+        bad_mask : 2D bool array, optional
+            True where the pixel is *unusable* (e.g. `dq != 0`). NaN/inf
+            pixels in `image` are treated as bad automatically.
+        weight : 2D array, optional
+            Per-pixel weight, treated as proportional to inverse variance
+            (e.g. a coadd exposure/read-noise weight map). Non-finite or
+            non-positive weights are treated as bad automatically. If
+            omitted, every valid pixel gets weight 1 (unweighted case).
+        source_mask : 2D bool array, optional
+            True for pixels to *keep* as background/sky when estimating the
+            local (mu_i, sigma0_i) background-annulus statistics; False to
+            exclude (e.g. pixels already flagged as sources by a smaller,
+            earlier tier, passed in so this tier's background estimate
+            isn't biased by those sources' wings). Same convention as the
+            mask `flag_sources` returns: True = background. This affects
+            *only* the background-annulus statistics -- the neighbor
+            (correlation) term, and I itself, are still evaluated at every
+            valid pixel regardless of source_mask. If omitted, every valid
+            pixel is treated as background (the original behavior).
+
+        Returns
+        -------
+        LocalMoranResult
+        """
+        image = np.asarray(image, dtype=np.float64)
+        finite = np.isfinite(image)
+
+        if bad_mask is None:
+            valid_mask = finite
+        else:
+            bad_mask = np.asarray(bad_mask, dtype=bool)
+            valid_mask = finite & ~bad_mask
+
+        if weight is None:
+            weight = np.ones_like(image)
+        else:
+            weight = np.asarray(weight, dtype=np.float64)
+            valid_mask = valid_mask & np.isfinite(weight) & (weight > 0)
+
+        if source_mask is None:
+            bg_valid_mask = valid_mask
+        else:
+            source_mask = np.asarray(source_mask, dtype=bool)
+            if source_mask.shape != image.shape:
+                raise ValueError(
+                    f"source_mask shape {source_mask.shape} != image shape {image.shape}"
+                )
+            # AND, not OR: keep a pixel for background estimation only if
+            # it's both currently valid AND not a previously-flagged source.
+            bg_valid_mask = valid_mask & source_mask
+
+        logger.debug(f"    compute: {np.count_nonzero(bad_mask) if bad_mask is not None else 0 = }")
+        logger.debug(f"    compute: {np.count_nonzero(valid_mask) = }")
+        mu_bg, sigma0_sq_bg, bg_count, bg_Wsum, clipped_mask = self._compute_bg_stats(
+            image, weight, bg_valid_mask
+        )
+        nbr_mean, nbr_cnt, nbr_W = self._neighbor_stats(image, weight, valid_mask)
+
+        sigma0_bg = np.sqrt(sigma0_sq_bg)
+        sigma0_safe = np.maximum(sigma0_bg, self.std_floor)
+
+        # Both terms are standardized by the SAME shared annulus scale --
+        # neither is rescaled by its own sampling precision, so I_i remains
+        # a correlation-type statistic rather than a significance test.
+        z_center = (image - mu_bg) / sigma0_safe
+        z_nbr = (nbr_mean - mu_bg) / sigma0_safe
+        I = z_center * z_nbr
+
+        logger.debug(f"TD: image shape: {image.shape}")
+        logger.debug(f"TD: valid_mask frac: {valid_mask.mean():.3f}")
+        outer_side = 2 * self.bg_half + 1
+        inner_side = 2 * self.exclude_half + 1
+        max_bg_count = outer_side ** 2 - inner_side ** 2
+        logger.debug(f"TD: max_bg_count={max_bg_count}, threshold={self.min_valid_frac*max_bg_count:.0f}")
+        logger.debug(f"TD: bg_count stats: min={bg_count.min():.0f} median={np.median(bg_count):.0f} max={bg_count.max():.0f}")
+        logger.debug(f"TD: frac pixels below low_conf threshold: {(bg_count < self.min_valid_frac*max_bg_count).mean():.3f}")
+        logger.debug(f"TD: frac nbr_W<=0: {(nbr_W<=0).mean():.3f}")
+        low_conf = bg_count < (self.min_valid_frac * max_bg_count)
+
+        bad = low_conf | (nbr_W <= 0) | ~valid_mask
+        I = np.where(bad, np.nan, I)
+        z_center = np.where(bad, np.nan, z_center)
+        z_nbr = np.where(bad, np.nan, z_nbr)
+
+        return LocalMoranResult(
+            I=I,
+            z_center=z_center,
+            z_neighbor_mean=z_nbr,
+            bg_mean=mu_bg,
+            bg_scale=np.sqrt(sigma0_sq_bg),
+            bg_valid_count=bg_count,
+            bg_weight_sum=bg_Wsum,
+            neighbor_valid_count=nbr_cnt,
+            neighbor_weight_sum=nbr_W,
+        )
+
+    # ------------------------------------------------------------------
+    # Sliding-patch Global Moran's I
     # ------------------------------------------------------------------
 
     def compute_sliding_global_I(
@@ -533,20 +698,129 @@ class SlidingMoranSourceFilter:
         bg_half_b = max(exclude_half_b + 1, round(self.bg_half / block))
         return corr_half_b, bg_half_b, exclude_half_b
 
+    def compute_block_averaged(
+        self,
+        image: np.ndarray,
+        block: int,
+        bad_mask: Optional[np.ndarray] = None,
+        weight: Optional[np.ndarray] = None,
+        source_mask: Optional[np.ndarray] = None,
+        min_valid_frac_block: float = 0.5,
+        source_frac_threshold: float = 1.0,
+        replicate: bool = True,
+        verbose: bool = True,
+    ) -> LocalMoranResult:
+        """
+        Block-average the image by `block`x`block`, run the filter on the
+        coarse grid, and (by default) replicate the result back to the
+        native pixel grid.
+
+        corr_half, bg_half, and exclude_half on this instance are always
+        interpreted at *native pixel* scale (the same scale you'd use with
+        plain compute()) -- this method converts them to block-grid units
+        itself (nearest integer, minimum 1, with the usual ordering
+        constraints re-applied after rounding) so you don't have to
+        pre-divide by `block` yourself. Set verbose=False to silence the
+        one-line report of the resolved block-grid window sizes.
+
+        Block averaging by `block` reduces the pixel count -- and so the
+        cost of every step, including the filter itself -- by block**2,
+        making a large effective footprint (needed to clear the wings of
+        big, extended sources) far cheaper than reaching it by growing
+        corr_half/bg_half at native resolution.
+
+        The coarse-grid I map is blocky (piecewise constant over each
+        block) after replication -- fine for masking, but note it if you
+        need a smooth map.
+
+        source_mask : 2D bool array, optional
+            Native-resolution mask, same convention as compute() (True =
+            background), typically the output of a smaller/earlier tier's
+            flag_sources(). It's downsampled to the coarse block grid
+            before being handed to the coarse compute(): a coarse block
+            counts as background only if the fraction of native background
+            pixels within it is >= source_frac_threshold. The default of
+            1.0 is conservative -- any block that straddles a source is
+            itself excluded from the coarse background estimate, so it
+            can't be contaminated by the source's wings; loosen it toward
+            0.5 if that ends up excluding too much near-source area.
+        """
+        corr_half_b, bg_half_b, exclude_half_b = self._scale_params_to_block(block)
+        logger.debug(
+            "compute_block_averaged: block=%d -> corr_half=%d, bg_half=%d, exclude_half=%d "
+            "(block-grid units; effective native footprint corr=%d, bg=%d, exclude=%d px)",
+            block, corr_half_b, bg_half_b, exclude_half_b,
+            corr_half_b * block, bg_half_b * block, exclude_half_b * block,
+        )
+
+        coarse_filt = SlidingMoranSourceFilter(
+            corr_half=corr_half_b,
+            bg_half=bg_half_b,
+            exclude_half=exclude_half_b,
+            sigma_clip=self.sigma_clip,
+            clip_iters=self.clip_iters,
+            std_floor=self.std_floor,
+            min_valid_frac=self.min_valid_frac,
+        )
+
+        block_image, block_weight, block_bad, orig_shape = block_average(
+            image, block, bad_mask=bad_mask, weight=weight, min_valid_frac=min_valid_frac_block
+        )
+
+        if source_mask is None:
+            block_source_mask = None
+        else:
+            source_mask = np.asarray(source_mask, dtype=bool)
+            if source_mask.shape != image.shape:
+                raise ValueError(
+                    f"source_mask shape {source_mask.shape} != image shape {image.shape}"
+                )
+            # Downsample the native-resolution source_mask to the coarse
+            # grid by taking the per-block fraction of background pixels
+            # (reusing block_average as a plain block-mean; min_valid_frac=0
+            # here just means "don't additionally flag blocks bad", since
+            # block_bad from the image itself already covers that).
+            block_sky_frac, _, _, _ = block_average(
+                source_mask.astype(np.float64), block, min_valid_frac=0.0
+            )
+            block_source_mask = block_sky_frac >= source_frac_threshold
+
+        coarse = coarse_filt.compute(
+            block_image, bad_mask=block_bad, weight=block_weight, source_mask=block_source_mask
+        )
+
+        if not replicate:
+            return coarse
+
+        rep = lambda a: block_replicate(a, block, orig_shape)
+        return LocalMoranResult(
+            I=rep(coarse.I),
+            z_center=rep(coarse.z_center),
+            z_neighbor_mean=rep(coarse.z_neighbor_mean),
+            bg_mean=rep(coarse.bg_mean),
+            bg_scale=rep(coarse.bg_scale),
+            bg_valid_count=rep(coarse.bg_valid_count),
+            bg_weight_sum=rep(coarse.bg_weight_sum),
+            neighbor_valid_count=rep(coarse.neighbor_valid_count),
+            neighbor_weight_sum=rep(coarse.neighbor_weight_sum),
+        )
+
     def flag_sources(
             self,
             image: np.ndarray,
             bad_mask: Optional[np.ndarray] = None,
             weight: Optional[np.ndarray] = None,
+            source_mask: Optional[np.ndarray] = None,
 
     ) -> np.ndarray:
         """
          Carries out the following steps:
          - Convolves the image with a tophat of radius pre_tophat if pre_tophat > 0
+         - Compputes Moran's I, either block resampled or at the native scale depending on block size
          - Convolves the Moran's I array with a tophat if post_tophat > 0
-         - Thresholds to identify high values of Moran's I as sources
-         - Fills in holes in this mask
-         - Optionally removes small disconnected regions in this mask (which are probably not real sources)
+         - Thresholds to identify high & low values of Moran's I as sources
+         - Convolves this mask with a tophat if dilation_tophat > 0
+         - Thresholds this dilated mask to convert back to a boolean
          - Returns a mask with True for background and False for source
 
         Parameters
@@ -560,6 +834,14 @@ class SlidingMoranSourceFilter:
             (e.g. a coadd exposure/read-noise weight map). Non-finite or
             non-positive weights are treated as bad automatically. If
             omitted, every valid pixel gets weight 1 (unweighted case).
+        source_mask : 2D bool array, optional
+            True for background/sky pixels, False for already-flagged
+            sources -- same convention this method returns. Pass in a
+            smaller/earlier tier's result here so *this* tier's background
+            statistics aren't biased by sources that tier already found.
+            Only affects background-annulus estimation, not which pixels
+            are eligible to be flagged here. If omitted, every valid pixel
+            is treated as background (the original, single-tier behavior).
 
         Returns
         -------
@@ -595,7 +877,12 @@ class SlidingMoranSourceFilter:
         logger.debug(f"    pre_convolved: time, resources: {time.time()-start}, {rss_gb()} GB")
 
         # Compute the I statistic
-        moransi = self.compute_sliding_global_I(cimg, bad_mask=bad_mask, weight=weight)
+        if self.block_size > 0:
+            moransi = self.compute_block_averaged(
+                cimg, block=self.block_size, bad_mask=bad_mask, weight=weight, source_mask=source_mask
+            )
+        else:
+            moransi = self.compute(cimg, bad_mask=bad_mask, weight=weight, source_mask=source_mask)
         logger.debug(f"    {np.count_nonzero(np.isfinite(moransi.I[valid])) = }")
         logger.debug(f"    {moransi.I.min() = }, {moransi.I.max() = } {np.median(moransi.I[valid]) = }") 
         logger.debug(f"    computed I: time, resources {time.time()-start}, {rss_gb()} GB")
@@ -627,27 +914,12 @@ class SlidingMoranSourceFilter:
         logger.debug(f"    Identified valid pixels: time, resources: {time.time()-start}, {rss_gb()} GB")
         valid_istat = istat[good_istat]
         logger.debug(f"    Selected valid pixels: time, resources: {time.time()-start}, {rss_gb()} GB")
-
-        # Set the I threshold
-        # Either a fixed percentage of the pixels are designated as sky
-        if threshold_type == 'percentile':  
-             condition = globalI.I > np.percentile(gi,100-self.sky_percentage)
-        # Or a fixed threshold in the I value is used
-        else:
-             condition = (globalI.I > self.globalI_threshold)
-
-        # Create the mask (True = Source)
-        mask = np.where(condition,True,False)
-
-        # Fill holes
-        mask  = binary_fill_holes(mask)
-
-        # Erode small segments
-        if self.opening_iterations > 0:
-             mask = binary_opening(mask,iterations=self.opening_iterations)
-
-        # Report some statistics
-        flag_as_source = mask
+        p50 = np.percentile(valid_istat,50.)
+        p16 = np.percentile(valid_istat,16.)
+        p84 = np.percentile(valid_istat,84.)
+        x = (istat-p50)/((p84-p16)/2.)
+        logger.debug(f"  p16, p50, p84: {p16:8.5f} {p50:8.5f} {p84:8.5f}")
+        flag_as_source = valid & ((x < -self.i_lower_nsigma) | (x > self.i_upper_nsigma))
         frac_tot_masked = np.count_nonzero(flag_as_source) /  len(image.flat)
         frac_valid_masked = np.count_nonzero(flag_as_source) /  np.count_nonzero(valid)
         logger.info(f"  percent of total masked, pre-dilation: {100*frac_tot_masked:.3f}")
@@ -677,3 +949,36 @@ class SlidingMoranSourceFilter:
 
         return ~flag_as_source,istat
 
+
+# ----------------------------------------------------------------------
+# Example usage (not executed on import):
+#
+#   from local_moran import SlidingMoranSourceFilter
+#
+#   filt = SlidingMoranSourceFilter(
+#       corr_half=1, bg_half=10, exclude_half=3,
+#       sigma_clip=3.0, clip_iters=2,
+#   )
+#
+#   bad_mask = (dq_array != 0)
+#   result = filt.compute(sci_array, bad_mask=bad_mask, weight=weight_array)
+#   source_mask = filt.flag_sources(result, i_thresh=2.0)
+#
+#   # For a larger effective footprint (e.g. to mask the wings of bright,
+#   # extended sources) cheaply: block-average by `block`. corr_half /
+#   # bg_half / exclude_half above are native-pixel scale either way --
+#   # compute_block_averaged converts them to block-grid units itself.
+#   result_ba = filt.compute_block_averaged(
+#       sci_array, block=5, bad_mask=bad_mask, weight=weight_array,
+#   )
+#   source_mask_ba = filt.flag_sources(result_ba, i_thresh=2.0)
+#
+#   # Sliding-patch Global Moran's I: one shared reference per patch,
+#   # rather than compute()'s per-pixel annulus reference. Good for
+#   # background-dominated fields where a patch's own mean/variance is
+#   # already a solid "typical sky" reference.
+#   result_g = filt.compute_sliding_global_I(sci_array, patch_half=10, weight=weight_array)
+#   # result_g.I is a map of the sliding Global I statistic; threshold it
+#   # the same way you would compute()'s I map (e.g. relative to its own
+#   # whole-image percentiles) to get a source mask.
+# ----------------------------------------------------------------------
