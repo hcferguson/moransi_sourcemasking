@@ -29,6 +29,9 @@ from typing import Optional
 # For reading configuration file
 import yaml
 from box import Box
+from collections.abc import Mapping
+from os import PathLike
+from pathlib import Path
 
 # For closing holes and removing small disconnected patches
 from scipy.ndimage import binary_fill_holes, binary_opening
