@@ -775,8 +775,8 @@ def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
               patch_size:           20  # This is the patch full width in pixels
               n_box_passes:          1  # Boxcar smooth the I statistic array before thresholding
               opening_iterations:    2  # Remove small disconnected sources in the mask
-              threshold_type: "I value" # "I value" or "percentile"
-              threshold_value:    0.30  # Threshold in percent or in I value (30-40% or I=0.3-0.4 generally work)
+              threshold_type: "percentage" # "I value" or "percentile" or "percentage"
+              threshold_value:      35  # Threshold in percent or in I value (30-40% or I=0.3-0.4 generally work)
               
               # The source masking seems to be working fine with no convolution, dilation or block averaging
               dilation_tophat:    0  # Don't dilate
