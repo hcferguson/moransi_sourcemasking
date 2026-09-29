@@ -789,7 +789,8 @@ def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
                # For sigma clipping when computing the standard deviation in the patch 
               sigma_clip:       3.0
               clip_iters:         2 ''')
-        config = Box(yaml.safe_load(config_string))
+        pars = yaml.safe_load(config_string)
+        config = Box(dict(pars))
 
     # Otherwise take the parameters from an input dictionary or read from a yaml file
     else:
