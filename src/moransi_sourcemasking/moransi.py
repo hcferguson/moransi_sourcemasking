@@ -736,8 +736,8 @@ def read_config(config):
         return pars
     if isinstance(config, (str, PathLike)):
         with open(Path(config)) as f:
-            pars = yaml.safe_load(f) or {}
-            pars = Box(dict(config))
+            _pars = yaml.safe_load(f) or {}
+            pars = Box(dict(_pars))
             return pars
     raise TypeError(
         f"config must be a path or a mapping, not {type(config).__name__}"
