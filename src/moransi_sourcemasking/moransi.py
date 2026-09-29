@@ -679,7 +679,7 @@ class SlidingMoranSourceFilter:
 
         # Set the I threshold
         # Either a fixed percentage of the pixels are designated as sky
-        if self.threshold_type == 'percentile':  
+        if self.threshold_type == 'percentile' or self.threshold_type == 'percentage': 
              condition = istat > np.percentile(valid_istat,100.-self.threshold_value)
         # Or a fixed threshold in the I value is used
         else:
@@ -775,7 +775,7 @@ def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
               patch_size:           20  # This is the patch full width in pixels
               n_box_passes:          1  # Boxcar smooth the I statistic array before thresholding
               opening_iterations:    2  # Remove small disconnected sources in the mask
-              threshold_type: "I value" # "I value" or "percentage"
+              threshold_type: "I value" # "I value" or "percentile"
               threshold_value:    0.30  # Threshold in percent or in I value (30-40% or I=0.3-0.4 generally work)
               
               # The source masking seems to be working fine with no convolution, dilation or block averaging
