@@ -673,10 +673,10 @@ class SlidingMoranSourceFilter:
         # Set the I threshold
         # Either a fixed percentage of the pixels are designated as sky
         if self.threshold_type == 'percentile':  
-             condition = globalI.I > np.percentile(gi,100.-self.threshold_value)
+             condition = istat > np.percentile(valid_istat,100.-self.threshold_value)
         # Or a fixed threshold in the I value is used
         else:
-             condition = (globalI.I > self.threshold_value)
+             condition = (istat > self.threshold_value)
 
         # Create the mask (True = Source)
         mask = np.where(condition,True,False)
