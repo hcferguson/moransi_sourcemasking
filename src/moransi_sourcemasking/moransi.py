@@ -725,19 +725,27 @@ class SlidingMoranSourceFilter:
 # Convenience functions to read parameters from a yaml file and use that to drive
 # the sourcemasking
 
-def read_config(configfile):
-    ''' Read yaml configuration file '''
-    with open(configfile) as f:
-        config = Box(yaml.safe_load(f))
-    return config
+def read_config(config):
+    """Return a dict from a YAML path or a mapping."""
+    if isinstance(config, Mapping):
+        config = Box(dict(config))  # shallow copy so callers' dicts aren't mutated
+        return config
+    if isinstance(config, (str, PathLike)):
+        with open(Path(config)) as f:
+            config = yaml.safe_load(f) or {}
+            config = Box(config)
+            return config
+    raise TypeError(
+        f"config must be a path or a mapping, not {type(config).__name__}"
+    )
 
-def make_sourcemask(image,configfile,bad_mask=None,weight=None):
+def make_sourcemask(image,config,bad_mask=None,weight=None):
     ''' Make a source mask, applying all the tiers
 
         Parameters
         ----------
         image : 2D array
-        config : dictionary of control parameters
+        config : a path to a yaml file or a dictionary of control parameters
         bad_mask : 2D bool array, optional
             True where the pixel is *unusable* (e.g. `dq != 0`). NaN/inf
             pixels in `image` are treated as bad automatically.
