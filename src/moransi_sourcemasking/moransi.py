@@ -32,8 +32,9 @@ from box import Box
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
+import textwrap
 
-# For closing holes and removing small disconnected patches
+# Ford closing holes and removing small disconnected patches
 from scipy.ndimage import binary_fill_holes, binary_opening
 
 import numpy as np
@@ -767,8 +768,8 @@ def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
 
     # Default parameters
     if pars is None:
-        config = yaml.safe_load(
-           ```---
+        config_string = textwrap.dedent('''
+              ---
               # These are the three parameters that really matter for global I source masking
               kernel_width:          3  # This kernel is a 3x3 box with a 0 in the center
               patch_size:           20  # This is the patch full width in pixels
@@ -777,7 +778,7 @@ def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
               threshold_type: "I value" # "I value" or "percentage"
               threshold_value:    0.30  # Threshold in percent or in I value (30-40% or I=0.3-0.4 generally work)
               
-               # The source masking seems to be working fine with no convolution, dilation or block averaging
+              # The source masking seems to be working fine with no convolution, dilation or block averaging
               dilation_tophat:    0  # Don't dilate
               pre_tophat:         0
               post_tophat:        0
@@ -787,9 +788,8 @@ def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
               
                # For sigma clipping when computing the standard deviation in the patch 
               sigma_clip:       3.0
-              clip_iters:         2
-           ```
-        config = Box(config)
+              clip_iters:         2 ''')
+        config = Box(yaml.safe_load(config_string))
 
     # Otherwise take the parameters from an input dictionary or read from a yaml file
     else:
