@@ -26,8 +26,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+# For reading configuration file
+import yaml
+from box import Box
+
 import numpy as np
 
+# For variants that convolve the image or the array of I statistics
 from astropy.convolution import convolve, convolve_fft, Tophat2DKernel, Gaussian2DKernel
 
 
@@ -147,6 +152,35 @@ class SlidingMoranSourceFilter:
     """
     Parameters
     ----------
+    The important parameters: 
+
+    threshold_type: string
+        'percentage' -- set the value of I so that a fixed percentage of pixels are
+           designated as sky. Values of around 30-40% work well for high-latitude scenes.
+        'I value' -- set a threshold in the value of the global I statistic for each patch.
+          I ranges from -1 to 1. Pure Gaussian noise has a narrow peak at I ~ 0. Fixed 
+          pattern noise like 1/f striping or residual amplifier bias tends to induce a 
+          positive skew. Limited testing suggests that thresholds of I > 0.5 (for sources)
+          are safe (not falsely masking sky patches), but leave the wings of fluffy galaxies.
+          Thresholds of I > 0.3 are preferable, but might start to mask real sky pixels. 
+    threshold_value: float
+         A percentage of pixels to designate as sky (typically ~30-40%) or a threshold
+         in the value of I (typically I ~ 0.3-0.5), depending on threshold_type.
+    opening_iterations: int
+         The initial global-I statistic array may be eating into the sky noise enough that there
+         are small patches in the resulting source mask that don't correspond to real sources.
+         One way to mitigate this while still keeping the thresholds set to address the wings
+         of fluffy galaxies is to weed out the small disconnected patches from the source mask
+         using a binary opening morphology operation. It is best to keep the number of iterations
+         low to avoid affecting the real sources (1-3 iterations).
+    n_box_passes: int
+         The patches used to compute the global I statistic are square (for performance). To
+         smooth out the patches so that they aren't quite so blocky, we box filter the I statistic
+         array in a few passes. One pass seems better than none, but more than a few makes it 
+         harder to mask out fluffy sources. 
+    
+    The rest of the parameters are best left at their defaults.
+
     pre_tophat, post_tophat, dilation_tophat : int
         Native pixel scale; radii of a tophat filter to apply 
           (pre) before computing Moran's I,
@@ -185,6 +219,10 @@ class SlidingMoranSourceFilter:
 
     def __init__(
         self,
+        threshold_type: 'I value',
+        threshold_value: float = 0.35,
+        opening_iterations: int = 2,
+        n_box_passes: int = 1,
         pre_tophat: int = 0,
         post_tophat: int = 0,
         dilation_tophat: int = 0,
@@ -199,6 +237,10 @@ class SlidingMoranSourceFilter:
     ):
         if patch_size <= kernel_width:
             raise ValueError("patch_size must be larger than kernel_widthf")
+        self.threshold_type = threshold_type
+        self.threshold_value = threshold_value
+        self.opening_iterations = opening_iterations
+        self.n_box_passes = n_box_passes
         self.corr_half = kernel_width // 2
         self.bg_half = patch_size // 2
         self.sigma_clip = sigma_clip
@@ -595,7 +637,7 @@ class SlidingMoranSourceFilter:
         logger.debug(f"    pre_convolved: time, resources: {time.time()-start}, {rss_gb()} GB")
 
         # Compute the I statistic
-        moransi = self.compute_sliding_global_I(cimg, bad_mask=bad_mask, weight=weight)
+        moransi = self.compute_sliding_global_I(cimg, bad_mask=bad_mask, weight=weight, n_box_passes = self.n_box_passes)
         logger.debug(f"    {np.count_nonzero(np.isfinite(moransi.I[valid])) = }")
         logger.debug(f"    {moransi.I.min() = }, {moransi.I.max() = } {np.median(moransi.I[valid]) = }") 
         logger.debug(f"    computed I: time, resources {time.time()-start}, {rss_gb()} GB")
@@ -630,11 +672,11 @@ class SlidingMoranSourceFilter:
 
         # Set the I threshold
         # Either a fixed percentage of the pixels are designated as sky
-        if threshold_type == 'percentile':  
-             condition = globalI.I > np.percentile(gi,100-self.sky_percentage)
+        if self.threshold_type == 'percentile':  
+             condition = globalI.I > np.percentile(gi,100.-self.threshold_value)
         # Or a fixed threshold in the I value is used
         else:
-             condition = (globalI.I > self.globalI_threshold)
+             condition = (globalI.I > self.threshold_value)
 
         # Create the mask (True = Source)
         mask = np.where(condition,True,False)
@@ -676,4 +718,43 @@ class SlidingMoranSourceFilter:
         logger.info(f"  percent of valid masked, post-dilation: {100*frac_valid_masked:.3f}")
 
         return ~flag_as_source,istat
+
+# Convenience functions to read parameters from a yaml file and use that to drive
+# the sourcemasking
+
+def read_config(configfile):
+    ''' Read yaml configuration file '''
+    with open(configfile) as f:
+        config = Box(yaml.safe_load(f))
+    return config
+
+def make_sourcemask(image,configfile,bad_mask=None,weight=None):
+    ''' Make a source mask, applying all the tiers
+
+        Parameters
+        ----------
+        image : 2D array
+        config : dictionary of control parameters
+        bad_mask : 2D bool array, optional
+            True where the pixel is *unusable* (e.g. `dq != 0`). NaN/inf
+            pixels in `image` are treated as bad automatically.
+        weight : 2D array, optional
+            Per-pixel weight, treated as proportional to inverse variance
+            (e.g. a coadd exposure/read-noise weight map). Non-finite or
+            non-positive weights are treated as bad automatically. If
+            omitted, every valid pixel gets weight 1 (unweighted case).
+
+        Returns
+        -------
+        source mask (OR of all the tiers)
+    '''
+
+    # Assume all pixels are background to start
+    mask = np.ones(image.shape,dtype='bool')
+
+    # Loop through the tiers
+    config = read_config(configfile)
+    filt = SlidingMoranSourceFilter(**config)
+    mask, istat = filt.flag_sources(image,bad_mask=bad_mask,weight=weight)
+    return mask
 

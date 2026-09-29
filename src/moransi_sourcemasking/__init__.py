@@ -7,12 +7,11 @@ try:
 except PackageNotFoundError:
     # package isn't installed (e.g. running from a source checkout without
     # `pip install -e .` yet)
-    __version__ = "0.2.0.dev0"
+    __version__ = "0.3.0.dev0"
 
 __author__ = "Henry C. ferguson"   
 
-from .moransi import SlidingMoranSourceFilter, SlidingGlobalIResult
-from .tiered_sourcemask import make_sourcemask, make_individual_sourcemasks, read_config
+from .moransi import SlidingMoranSourceFilter, SlidingGlobalIResult, make_sourcemask, read_config
 from .block_average import (
     block_average_robust,
     noise_correlation_ratio,

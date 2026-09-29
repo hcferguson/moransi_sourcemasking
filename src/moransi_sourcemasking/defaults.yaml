@@ -1,10 +1,12 @@
 ---
  # These are the three parameters that really matter for global I source masking
-corr_half:          1  # This kernel is a 3x3 box with a 0 in the center
-bg_half:           10  # This is the patch half-size
-dilation_tophat:    0  # Don't dilate
+kernel_width:       3  # This kernel is a 3x3 box with a 0 in the center
+patch_size:        20  # This is the patch full width in pixels
+n_box_passes:       1  # Boxcar smooth the I statistic array before thresholding
+opening_iterations: 2  # Remove small disconnected sources in the mask
 
  # The source masking seems to be working fine with no convolution, dilation or block averaging
+dilation_tophat:    0  # Don't dilate
 pre_tophat:         0
 post_tophat:        0
 dilation_tophat:    0  # Don't dilate
@@ -17,3 +19,4 @@ i_upper_nsigma:  10.0
 exclude_half:       4
 sigma_clip:       3.0
 clip_iters:         2
+
