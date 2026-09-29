@@ -15,9 +15,7 @@ from .moransi import (
     SlidingMoranSourceFilter, 
     SlidingGlobalIResult, 
     make_sourcemask, 
-    read_config, 
-    flag_sources, 
-    compute_sliding_global_i
+    read_config 
 )
 from .block_average import (
     block_average_robust,
