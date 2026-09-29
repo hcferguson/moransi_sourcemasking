@@ -30,6 +30,9 @@ from typing import Optional
 import yaml
 from box import Box
 
+# For closing holes and removing small disconnected patches
+from scipy.ndimage import binary_fill_holes, binary_opening
+
 import numpy as np
 
 # For variants that convolve the image or the array of I statistics
