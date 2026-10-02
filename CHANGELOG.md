@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+### [0.4.0] Refactored
+- Removed options to smooth the image before and after computing the statistic.
+  Removed the option to dilate the mask.
+  Removed computation of statistics in an annulus.
+
 ### Refactored
 - Removed the computation of the local Moran's I statistic and the tiered
   source masking. The global_I algorithm works at least as well without
