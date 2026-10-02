@@ -7,7 +7,7 @@ try:
 except PackageNotFoundError:
     # package isn't installed (e.g. running from a source checkout without
     # `pip install -e .` yet)
-    __version__ = "0.3.0.dev0"
+    __version__ = "0.4.0.dev0"
 
 __author__ = "Henry C. ferguson"   
 
