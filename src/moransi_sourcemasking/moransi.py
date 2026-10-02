@@ -198,6 +198,9 @@ class SlidingMoranSourceFilter:
     min_valid_frac : float
         If the fraction of valid pixels in a pixel's background annulus
         falls below this, that pixel's I is set to NaN.
+    std_floor : float
+        Minimum sigma0_i used in the denominator, to avoid blow-ups in
+        near-flat / heavily masked regions.
     """
 
     def __init__(
@@ -209,6 +212,7 @@ class SlidingMoranSourceFilter:
         kernel_width: int = 3,
         patch_size: int = 10,
         min_valid_frac: float = 0.3,
+        std_floor: float = 1.e-6
     ):
         if patch_size <= kernel_width:
             raise ValueError("patch_size must be larger than kernel_widthf")
@@ -219,6 +223,7 @@ class SlidingMoranSourceFilter:
         self.corr_half = kernel_width // 2
         self.bg_half = patch_size // 2
         self.min_valid_frac = min_valid_frac
+        self.std_floor = std_floor
 
     # ------------------------------------------------------------------
     # Integral-image machinery

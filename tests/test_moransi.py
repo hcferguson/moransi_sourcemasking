@@ -35,7 +35,7 @@ def test_sliding_global_I_matches_brute_force_unweighted():
     kernel_width, patch_size = 3, 20
 
     filt = SlidingMoranSourceFilter( kernel_width=kernel_width, patch_size=patch_size)
-    res = filt.compute_sliding_global_I(image, patch_half=patch_half)
+    res = filt.compute_sliding_global_I(image, patch_half=patch_size//2)
 
     def brute_force(x, c, patch_size, kernel_width):
         patch_half = patch_size // 2
