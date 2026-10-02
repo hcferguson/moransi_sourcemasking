@@ -206,11 +206,11 @@ class SlidingMoranSourceFilter:
     def __init__(
         self,
         threshold_type: str = "percentage",
-        threshold_value: float = 0.35,
+        threshold_value: float = 35,
         opening_iterations: int = 2,
         n_box_passes: int = 1,
         kernel_width: int = 3,
-        patch_size: int = 10,
+        patch_size: int = 20,
         min_valid_frac: float = 0.3,
         std_floor: float = 1.e-6
     ):
@@ -220,14 +220,25 @@ class SlidingMoranSourceFilter:
         self.threshold_value = threshold_value
         self.opening_iterations = opening_iterations
         self.n_box_passes = n_box_passes
-        self.corr_half = kernel_width // 2
-        self.bg_half = patch_size // 2
+        self.patch_size = patch_size
+        self.kernel_width = kernel_width
+        #self.corr_half = kernel_width // 2
+        #self.bg_half = patch_size // 2
         self.min_valid_frac = min_valid_frac
         self.std_floor = std_floor
 
     # ------------------------------------------------------------------
     # Integral-image machinery
     # ------------------------------------------------------------------
+
+    # Getters of the half widths for compatibility with original code
+    @property
+    def corr_half(self):
+        return self.kernel_width // 2 
+
+    @property
+    def bg_half(self):
+        return self.patch_size // 2 
 
     @staticmethod
     def _integral_image(arr: np.ndarray) -> np.ndarray:
