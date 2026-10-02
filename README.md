@@ -63,4 +63,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
+## Demo
+There is a demo jupyter notebook in the notebook directory.
+
 See `CHANGELOG.md` for release history.
