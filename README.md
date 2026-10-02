@@ -2,13 +2,11 @@
 
 Masking and block-statistics tools for astronomical images:
 
-- **`moransi`** — local (sliding-window) Moran's I spatial-autocorrelation
+- **`moransi`** — Sliding-window computation Moran's I spatial-autocorrelation
   statistic, with optional inverse-variance pixel weighting, used by
   `SlidingMoranSourceFilter` to flag source pixels vs. background.
-- **`sourcemask`** — driver that builds a tiered source mask by combining
-  several `SlidingMoranSourceFilter` configurations (radii, thresholds)
-  read from a YAML config file or from a dictionary.
-- **`block_average`** — robust (sigma-clipped) block-averaging of an image
+- **`block_average`** — For assessing the results of background subtraction.
+  This includes a robust (sigma-clipped) block-averaging of an image
   with propagated error and pixel masking, plus the drizzle
   noise-correlation ratio (Casertano et al. 2000 / Fruchter & Hook 2002).
 
@@ -22,24 +20,40 @@ pip install -e .
 
 ## Quick start
 
-```python
-from moransi_sourcemasking import SlidingMoranSourceFilter
+If you just want to mask the sources, using the default parameters, passing
+in a bad-pixel mask (True => bad) and a weight map (E.g. the inverse variance
+expected for each pixel.)
 
-filt = SlidingMoranSourceFilter(corr_half=1, bg_half=10, exclude_half=3)
-source_mask, istat = filt.flag_sources(image, bad_mask=dq_mask, weight=weight_map)
+```python
+from moransi_sourcemasking import make_sourcemask
+source_mask = make_sourcemask(image, bad_mask=dq_mask, weight=weight_map)
 ```
 
-```python
-from moransi_sourcemasking import read_config, make_sourcemask
+For more control, you can pass the parameters in a yaml file or as a dictionary
 
-config = read_config("tiers.yaml")
+```python
+from moransi_sourcemasking import make_sourcemask, read_config
+
+config = read_config("my_parameters.yaml")
+config['threshold_type'] = 'percentage'
+config['threshold_value'] = 40.
 mask = make_sourcemask(image, config, bad_mask=dq_mask, weight=weight_map)
 ```
 
+To look at the statistics as a function of scale after background subtraction
 ```python
 from moransi_sourcemasking import block_average_robust
 
-image_b, err_b, mask_b = block_average_robust(image, err, mask, block_size=4)
+# On a scale of 10 pixels
+block_size = 10
+image_b, err_b, mask_b = block_average_robust(image, err, mask, block_size=block_size)
+
+# Ratio of the measured sky RMS to that predicted from the error array
+rms_ratio = mad_std(image_b[mask_b]) / err_b[mask_b].mean()
+
+# Correct for the covariance introduce by resampling (if relevant)
+suppression = inverse_correlation_ratio(pixfrac,scale_ratio,block_size)
+corrected_ratio = rms_ratio / suppression
 ```
 
 ## Development
