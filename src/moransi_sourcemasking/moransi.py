@@ -508,6 +508,9 @@ class SlidingMoranSourceFilter:
            True for background pixels, False for source pixels
 
         """
+        # Use only valid pixels
+        valid = np.isfinite(image) & ~bad_mask
+
         # Compute the I statistic
         moransi = self.compute_sliding_global_I(image, bad_mask=bad_mask, weight=weight, n_box_passes = self.n_box_passes)
         logger.debug(f"    {np.count_nonzero(np.isfinite(moransi.I[valid])) = }")
