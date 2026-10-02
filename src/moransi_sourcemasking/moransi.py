@@ -508,6 +508,10 @@ class SlidingMoranSourceFilter:
            True for background pixels, False for source pixels
 
         """
+        # Profiling and debugging
+        logger.debug(f"start")
+        start = time.time()
+
         # Use only valid pixels
         if bad_mask is None:
             bad_mask = np.zeros(image.shape,'bool')
