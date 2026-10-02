@@ -509,7 +509,7 @@ class SlidingMoranSourceFilter:
 
         """
         # Compute the I statistic
-        moransi = self.compute_sliding_global_I(cimg, bad_mask=bad_mask, weight=weight, n_box_passes = self.n_box_passes)
+        moransi = self.compute_sliding_global_I(image, bad_mask=bad_mask, weight=weight, n_box_passes = self.n_box_passes)
         logger.debug(f"    {np.count_nonzero(np.isfinite(moransi.I[valid])) = }")
         logger.debug(f"    {moransi.I.min() = }, {moransi.I.max() = } {np.median(moransi.I[valid]) = }") 
         istat = moransi.I
