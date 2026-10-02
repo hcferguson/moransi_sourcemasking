@@ -18,8 +18,8 @@ def test_flag_sources_runs_on_flat_image():
 
 def test_flag_sources_detects_injected_point_source():
     rng = np.random.default_rng(1)
-    image = rng.normal(0, 1, size=(64, 64))
-    image[32, 32] += 50  # bright source, should get flagged (mask False there)
+    image = rng.normal(0, 1, size=(100, 100))
+    image[31:34,31:34] += 50 # bright source, should get flagged (mask False there)
 
     filt = SlidingMoranSourceFilter()
     mask, _ = filt.flag_sources(image)
