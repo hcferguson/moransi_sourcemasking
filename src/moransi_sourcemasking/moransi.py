@@ -202,7 +202,7 @@ class SlidingMoranSourceFilter:
 
     def __init__(
         self,
-        threshold_type: 'I value',
+        threshold_type: str = "percentage",
         threshold_value: float = 0.35,
         opening_iterations: int = 2,
         n_box_passes: int = 1,
@@ -599,18 +599,7 @@ def make_sourcemask(image,pars=None,bad_mask=None,weight=None):
               opening_iterations:    2  # Remove small disconnected sources in the mask
               threshold_type: "percentage" # "I value" or "percentile" or "percentage"
               threshold_value:      35  # Threshold in percent or in I value (30-40% or I=0.3-0.4 generally work)
-              
-              # The source masking seems to be working fine with no convolution, dilation or block averaging
-              dilation_tophat:    0  # Don't dilate
-              pre_tophat:         0
-              post_tophat:        0
-              dilation_tophat:    0  # Don't dilate
-              dilation_tophat:    0
-              block_size:         0
-              
-               # For sigma clipping when computing the standard deviation in the patch 
-              sigma_clip:       3.0
-              clip_iters:         2 ''')
+              ''')
         pars = yaml.safe_load(config_string)
         config = Box(dict(pars))
 
