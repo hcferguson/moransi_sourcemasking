@@ -509,6 +509,10 @@ class SlidingMoranSourceFilter:
 
         """
         # Use only valid pixels
+        if bad_mask is None:
+            bad_mask = np.zeros(image.shape,'bool')
+        else:
+            bad_mask = bad_mask.astype('bool')
         valid = np.isfinite(image) & ~bad_mask
 
         # Compute the I statistic
